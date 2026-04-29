@@ -33,7 +33,7 @@ pub fn read_daily_bars(
     filepath: &str,
     price_coeff: f64,
     vol_coeff: f64,
-) -> PyResult<Vec<PyObject>> {
+) -> PyResult<Vec<Py<PyAny>>> {
     let path = Path::new(filepath);
     if !path.exists() {
         return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
@@ -56,13 +56,42 @@ pub fn read_daily_bars(
         let offset = i * DAILY_RECORD_SIZE;
         let chunk = &data[offset..offset + DAILY_RECORD_SIZE];
 
-        let date = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
-        let open = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
-        let high = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
-        let low = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
-        let close = u32::from_le_bytes(chunk[16..20].try_into().unwrap());
-        let amount = f32::from_le_bytes(chunk[20..24].try_into().unwrap());
-        let volume = u32::from_le_bytes(chunk[24..28].try_into().unwrap());
+        let err = |msg| pyo3::exceptions::PyRuntimeError::new_err(msg);
+        let date = u32::from_le_bytes(
+            chunk[0..4]
+                .try_into()
+                .map_err(|_| err("bad daily record"))?,
+        );
+        let open = u32::from_le_bytes(
+            chunk[4..8]
+                .try_into()
+                .map_err(|_| err("bad daily record"))?,
+        );
+        let high = u32::from_le_bytes(
+            chunk[8..12]
+                .try_into()
+                .map_err(|_| err("bad daily record"))?,
+        );
+        let low = u32::from_le_bytes(
+            chunk[12..16]
+                .try_into()
+                .map_err(|_| err("bad daily record"))?,
+        );
+        let close = u32::from_le_bytes(
+            chunk[16..20]
+                .try_into()
+                .map_err(|_| err("bad daily record"))?,
+        );
+        let amount = f32::from_le_bytes(
+            chunk[20..24]
+                .try_into()
+                .map_err(|_| err("bad daily record"))?,
+        );
+        let volume = u32::from_le_bytes(
+            chunk[24..28]
+                .try_into()
+                .map_err(|_| err("bad daily record"))?,
+        );
         // chunk[28..32] is reserved
 
         let date_str = format!(
@@ -105,7 +134,7 @@ const MINUTE_RECORD_SIZE: usize = 32;
 /// Each dict has keys: datetime, open, high, low, close, amount, volume.
 #[pyfunction]
 #[pyo3(signature = (filepath,))]
-pub fn read_minute_bars(py: Python<'_>, filepath: &str) -> PyResult<Vec<PyObject>> {
+pub fn read_minute_bars(py: Python<'_>, filepath: &str) -> PyResult<Vec<Py<PyAny>>> {
     let path = Path::new(filepath);
     if !path.exists() {
         return Err(pyo3::exceptions::PyFileNotFoundError::new_err(format!(
@@ -128,8 +157,17 @@ pub fn read_minute_bars(py: Python<'_>, filepath: &str) -> PyResult<Vec<PyObject
         let offset = i * MINUTE_RECORD_SIZE;
         let chunk = &data[offset..offset + MINUTE_RECORD_SIZE];
 
-        let raw_date = u16::from_le_bytes(chunk[0..2].try_into().unwrap());
-        let raw_time = u16::from_le_bytes(chunk[2..4].try_into().unwrap());
+        let err = |msg| pyo3::exceptions::PyRuntimeError::new_err(msg);
+        let raw_date = u16::from_le_bytes(
+            chunk[0..2]
+                .try_into()
+                .map_err(|_| err("bad minute record"))?,
+        );
+        let raw_time = u16::from_le_bytes(
+            chunk[2..4]
+                .try_into()
+                .map_err(|_| err("bad minute record"))?,
+        );
 
         // TDX minute date encoding:
         // year  = (raw_date >> 11) + 2004
@@ -142,12 +180,36 @@ pub fn read_minute_bars(py: Python<'_>, filepath: &str) -> PyResult<Vec<PyObject
         let hour = raw_time / 60;
         let minute = raw_time % 60;
 
-        let open = f32::from_le_bytes(chunk[4..8].try_into().unwrap());
-        let high = f32::from_le_bytes(chunk[8..12].try_into().unwrap());
-        let low = f32::from_le_bytes(chunk[12..16].try_into().unwrap());
-        let close = f32::from_le_bytes(chunk[16..20].try_into().unwrap());
-        let amount = f32::from_le_bytes(chunk[20..24].try_into().unwrap());
-        let volume = u32::from_le_bytes(chunk[24..28].try_into().unwrap());
+        let open = f32::from_le_bytes(
+            chunk[4..8]
+                .try_into()
+                .map_err(|_| err("bad minute record"))?,
+        );
+        let high = f32::from_le_bytes(
+            chunk[8..12]
+                .try_into()
+                .map_err(|_| err("bad minute record"))?,
+        );
+        let low = f32::from_le_bytes(
+            chunk[12..16]
+                .try_into()
+                .map_err(|_| err("bad minute record"))?,
+        );
+        let close = f32::from_le_bytes(
+            chunk[16..20]
+                .try_into()
+                .map_err(|_| err("bad minute record"))?,
+        );
+        let amount = f32::from_le_bytes(
+            chunk[20..24]
+                .try_into()
+                .map_err(|_| err("bad minute record"))?,
+        );
+        let volume = u32::from_le_bytes(
+            chunk[24..28]
+                .try_into()
+                .map_err(|_| err("bad minute record"))?,
+        );
         // chunk[28..32] is reserved
 
         let datetime_str = format!("{}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, minute,);

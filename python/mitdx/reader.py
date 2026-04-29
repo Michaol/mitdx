@@ -16,6 +16,8 @@ from typing import Optional
 
 import pandas as pd
 
+from mitdx._core import read_daily_bars, read_minute_bars
+
 
 # Security type classification (ported from mootdx/contrib/compat.py)
 SECURITY_COEFFICIENT: dict[str, list[float]] = {
@@ -47,46 +49,30 @@ def _get_market(symbol: str) -> str:
     return "sz"
 
 
+SZ_MAP = {
+    "00": "SZ_A_STOCK", "30": "SZ_A_STOCK", "20": "SZ_B_STOCK",
+    "39": "SZ_INDEX", "15": "SZ_FUND", "16": "SZ_FUND", "18": "SZ_FUND",
+    "10": "SZ_BOND", "11": "SZ_BOND", "12": "SZ_BOND", "13": "SZ_BOND", "14": "SZ_BOND"
+}
+
+SH_MAP = {
+    "60": "SH_A_STOCK", "90": "SH_B_STOCK", "68": "SH_STAR_STOCK",
+    "00": "SH_INDEX", "88": "SH_INDEX", "99": "SH_INDEX",
+    "50": "SH_FUND", "51": "SH_FUND", "58": "SH_FUND",
+    "01": "SH_BOND", "02": "SH_BOND", "10": "SH_BOND", "11": "SH_BOND", "12": "SH_BOND",
+    "13": "SH_BOND", "14": "SH_BOND", "15": "SH_BOND", "16": "SH_BOND", "17": "SH_BOND",
+    "18": "SH_BOND", "19": "SH_BOND", "20": "SH_BOND"
+}
+
 def _get_security_type(filepath: str) -> str:
     """Detect security type from filepath for coefficient lookup."""
     fname = Path(filepath).stem.lower()
 
-    # Extract exchange prefix and code head
-    if fname.startswith("sh"):
-        exchange, code_head = "sh", fname[2:4]
-    elif fname.startswith("sz"):
-        exchange, code_head = "sz", fname[2:4]
-    else:
-        return "SZ_A_STOCK"  # default
-
-    if exchange == "sz":
-        if code_head in ("00", "30"):
-            return "SZ_A_STOCK"
-        if code_head == "20":
-            return "SZ_B_STOCK"
-        if code_head == "39":
-            return "SZ_INDEX"
-        if code_head in ("15", "16", "18"):
-            return "SZ_FUND"
-        if code_head in ("10", "11", "12", "13", "14"):
-            return "SZ_BOND"
-        return "SZ_A_STOCK"
-
-    if exchange == "sh":
-        if code_head == "60":
-            return "SH_A_STOCK"
-        if code_head == "90":
-            return "SH_B_STOCK"
-        if code_head == "68":
-            return "SH_STAR_STOCK"
-        if code_head in ("00", "88", "99"):
-            return "SH_INDEX"
-        if code_head in ("50", "51", "58"):
-            return "SH_FUND"
-        if code_head in ("01", "02", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20"):
-            return "SH_BOND"
-        return "SH_A_STOCK"
-
+    if fname.startswith("sz"):
+        return SZ_MAP.get(fname[2:4], "SZ_A_STOCK")
+    elif fname.startswith("sh"):
+        return SH_MAP.get(fname[2:4], "SH_A_STOCK")
+        
     return "SZ_A_STOCK"
 
 
@@ -143,10 +129,6 @@ class ReaderBase:
 
         return None
 
-
-class StdReader(ReaderBase):
-    """Standard market (A-shares) reader."""
-
     def daily(self, symbol: str, **kwargs) -> Optional[pd.DataFrame]:
         """Read daily bar data.
 
@@ -156,8 +138,6 @@ class StdReader(ReaderBase):
         Returns:
             DataFrame with columns: date, open, high, low, close, amount, volume
         """
-        from mitdx._core import read_daily_bars
-
         vipdoc = self._find_path(symbol=symbol, subdir="lday", suffix="day")
         if vipdoc is None:
             return None
@@ -184,8 +164,6 @@ class StdReader(ReaderBase):
         Returns:
             DataFrame with columns: datetime, open, high, low, close, amount, volume
         """
-        from mitdx._core import read_minute_bars
-
         subdir = "fzline" if str(suffix) == "5" else "minline"
         file_suffix = ["lc5", "5"] if str(suffix) == "5" else ["lc1", "1"]
 
@@ -207,56 +185,14 @@ class StdReader(ReaderBase):
         return self.minute(symbol, suffix=5)
 
 
+class StdReader(ReaderBase):
+    """Standard market (A-shares) reader."""
+    pass
+
+
 class ExtReader(ReaderBase):
-    """Extended market reader (futures, options, etc.)."""
+    """Extended market reader (futures, options, etc.).
 
-    def daily(self, symbol: str, **kwargs) -> Optional[pd.DataFrame]:
-        """Read extended market daily bar data."""
-        from mitdx._core import read_daily_bars
-
-        vipdoc = self._find_path(symbol=symbol, subdir="lday", suffix="day")
-        if vipdoc is None:
-            return None
-
-        records = read_daily_bars(str(vipdoc), price_coeff=0.01, vol_coeff=1.0)
-        if not records:
-            return None
-
-        df = pd.DataFrame(records)
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-        return df
-
-    def minute(self, symbol: str, **kwargs) -> Optional[pd.DataFrame]:
-        """Read extended market minute data."""
-        from mitdx._core import read_minute_bars
-
-        vipdoc = self._find_path(symbol=symbol, subdir="minline", suffix=["lc1", "1"])
-        if vipdoc is None:
-            return None
-
-        records = read_minute_bars(str(vipdoc))
-        if not records:
-            return None
-
-        df = pd.DataFrame(records)
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df.set_index("datetime", inplace=True)
-        return df
-
-    def fzline(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Read 5-minute bar data."""
-        from mitdx._core import read_minute_bars
-
-        vipdoc = self._find_path(symbol=symbol, subdir="fzline", suffix="lc5")
-        if vipdoc is None:
-            return None
-
-        records = read_minute_bars(str(vipdoc))
-        if not records:
-            return None
-
-        df = pd.DataFrame(records)
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df.set_index("datetime", inplace=True)
-        return df
+    Note: Extended market support is experimental.
+    """
+    pass

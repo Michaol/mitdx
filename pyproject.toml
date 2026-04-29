@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "mitdx"
-version = "0.1.0"
+version = "1.0.0"
 description = "通达信数据高性能读取接口 (Rust + Python)"
 readme = "README.md"
 requires-python = ">=3.9"
