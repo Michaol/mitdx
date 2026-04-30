@@ -30,7 +30,7 @@ jobs:
       - name: Run tests
         run: |
           pip install --no-deps --only-binary :all: dist/*.whl
-          pip install --only-binary :all: "pytest==8.4.1" --hash=sha256:539c70ba6fcead8e78eebbf1115e8b589e7565830d7d006a8723f19ac8a0afb7
+          pip install --only-binary :all: "pytest==8.4.1"
           pytest -m "not network" -v
   linux:
     runs-on: ubuntu-latest
