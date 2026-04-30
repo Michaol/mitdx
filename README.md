@@ -13,7 +13,8 @@
 
 修复 `finance()` 语义错误：原实现错误地别名到 `xdxr()`（除权除息 CMD `0x000F`），现改为调用独立的 `get_finance_info`（CMD `0x0010`），返回 34 字段财务摘要（流通股本、总资产、净利润等），与 mootdx 行为一致。
 
-### v1.1.0 (2026-04-30)
+<details>
+<summary>v1.1.0 (2026-04-30)</summary>
 
 新增 5 个 Rust 原生协议解析器，Python 层对齐全部 mootdx 核心 API。
 
@@ -28,6 +29,8 @@
 新增 Python API：`xdxr()` · `transactions()` · `quotes()` · `finance()` · `f10()` · `minute()` · `index()`
 
 其他：新增 `encoding_rs` 依赖处理 GBK；统一使用 `read_response()` / `require_stream()` 消除重复代码；`_market_code()` 改用 `removeprefix()` 替代 `lstrip()`。
+
+</details>
 
 <details>
 <summary>v1.0.0 (2026-04-29)</summary>
