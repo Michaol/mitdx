@@ -56,7 +56,8 @@ class Quotes:
             ips = [(ip, port) for name, ip, port in HQ_HOSTS]
             fastest_servers = ping_servers(ips)
 
-            for ip, port, latency in fastest_servers:
+            # Try top 3 lowest-latency servers
+            for ip, port, latency in fastest_servers[:3]:
                 if latency < 9999:  # Not completely failed
                     if self.connect(ip, port):
                         return
@@ -77,7 +78,7 @@ class Quotes:
             res = self.client.get_security_bars(category=frequency, market=market, code=symbol, start=start, count=count)
             return to_df(res, backend=backend)
         except Exception as e:
-            logger.error(f"Failed to fetch bars: {e}")
+            logger.error("Failed to fetch bars: %s", e)
             self.disconnect()  # Force reconnect next time
             raise
 
@@ -113,7 +114,7 @@ class Quotes:
             res = self.client.get_xdxr_info(market=market, code=symbol)
             return to_df(res, backend=backend)
         except Exception as e:
-            logger.error(f"Failed to fetch xdxr: {e}")
+            logger.error("Failed to fetch xdxr: %s", e)
             self.disconnect()
             raise
 
@@ -130,7 +131,7 @@ class Quotes:
             res = self.client.get_transaction_data(market=market, code=symbol, start=start, count=count)
             return to_df(res, backend=backend)
         except Exception as e:
-            logger.error(f"Failed to fetch transactions: {e}")
+            logger.error("Failed to fetch transactions: %s", e)
             self.disconnect()
             raise
 
@@ -162,7 +163,7 @@ class Quotes:
             res = self.client.get_security_quotes(stock_list=stock_list)
             return to_df(res, backend=backend)
         except Exception as e:
-            logger.error(f"Failed to fetch quotes: {e}")
+            logger.error("Failed to fetch quotes: %s", e)
             self.disconnect()
             raise
 
@@ -180,7 +181,7 @@ class Quotes:
             res = self.client.get_finance_info(market=market, code=symbol)
             return to_df([res], backend=backend)
         except Exception as e:
-            logger.error(f"Failed to fetch finance: {e}")
+            logger.error("Failed to fetch finance: %s", e)
             self.disconnect()
             raise
 
@@ -211,7 +212,7 @@ class Quotes:
             result["content"] = "\n".join(parts)
             return result
         except Exception as e:
-            logger.error(f"Failed to fetch F10: {e}")
+            logger.error("Failed to fetch F10: %s", e)
             self.disconnect()
             raise
 
@@ -219,6 +220,6 @@ class Quotes:
         self._ensure_connected()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.disconnect()
 

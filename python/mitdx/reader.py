@@ -37,10 +37,11 @@ SECURITY_COEFFICIENT: dict[str, list[float]] = {
 
 def _get_market(symbol: str) -> str:
     """Determine market (sh/sz) from symbol code prefix."""
-    code = symbol.lstrip("shSHszSZ#")[:2]
+    s = symbol.lower()
+    if s.startswith("sh") or s.startswith("sz"):
+        return s[:2]
 
-    if symbol.lower().startswith("sh") or symbol.lower().startswith("sz"):
-        return symbol[:2].lower()
+    code = s.removeprefix("sh").removeprefix("sz").removeprefix("#")[:2]
 
     # Infer from code prefix
     if code in ("60", "68", "90", "00", "11", "50", "51", "58", "88", "99"):

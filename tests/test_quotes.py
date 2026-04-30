@@ -1,6 +1,7 @@
 import pytest
 from mitdx.quotes import Quotes
 
+@pytest.mark.network
 def test_quotes_bars():
     with Quotes.factory(market='std') as client:
         # 600036 招银

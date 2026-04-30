@@ -1,8 +1,11 @@
+import logging
 import urllib.request
 import re
 import datetime
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # Provide a simple local cache function
 CACHE_DIR = Path.home() / '.mitdx'
@@ -12,7 +15,7 @@ def _fetch_holiday_data():
     req = urllib.request.Request('https://www.tdx.com.cn/url/holiday/', headers={'User-Agent': 'Mozilla/5.0 mitdx/0.1.0'})
     with urllib.request.urlopen(req, timeout=5) as response:
         text = response.read().decode('gbk')
-        ret = re.findall(r'<textarea id="data" style="display:none;">([\s\w\W]+?)</textarea>', text, re.M)
+        ret = re.findall(r'<textarea id="data" style="display:none;">([\s\S]+?)</textarea>', text, re.M)
         if ret:
             return ret[0].strip()
         return ""
@@ -23,7 +26,7 @@ def _get_holidays_from_cache():
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass  # Handle read-only file systems gracefully
-        
+
     # Refresh cache if older than 7 days or not exists
     try:
         if CACHE_FILE.exists():
@@ -32,11 +35,12 @@ def _get_holidays_from_cache():
                 return CACHE_FILE.read_text(encoding='utf-8')
     except OSError:
         pass
-            
+
     # Fetch new
     try:
         data = _fetch_holiday_data()
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to fetch holiday data from TDX server: %s", e)
         data = ""
 
     if data:
@@ -51,7 +55,7 @@ def _get_holidays_from_cache():
                 data = CACHE_FILE.read_text(encoding='utf-8')
         except OSError:
             pass
-        
+
     return data
 
 # Module level cached set of Chinese holiday date strings "YYYY-MM-DD"

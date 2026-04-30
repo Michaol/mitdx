@@ -15,7 +15,7 @@ def _get_connected_client() -> TdxClient:
         try:
             if client.connect(ip, port):
                 return client
-        except (OSError, ConnectionError):
+        except OSError:
             pass
     raise ConnectionError("Failed to connect to any TDX Financial (GP) Server to fetch affairs")
 
@@ -87,24 +87,20 @@ class Affair:
         header_size = struct.calcsize(header_pack_format)
 
         tmpdir = None
-        dat_fp = None
-
         try:
             if filepath.suffix == '.zip':
                 tmpdir = Path(tempfile.mkdtemp(prefix='mitdx_'))
                 shutil.unpack_archive(filepath, extract_dir=tmpdir)
-                for file in tmpdir.iterdir():
-                    if file.suffix == '.dat':
-                        dat_fp = open(file, 'rb')
-                        break
-                if not dat_fp:
+                dat_file = next((f for f in tmpdir.iterdir() if f.suffix == '.dat'), None)
+                if not dat_file:
                     raise FileNotFoundError(f"No .dat file found in zip archive: {filepath}")
+                dat_path = dat_file
             elif filepath.suffix == '.dat':
-                dat_fp = open(filepath, 'rb')
+                dat_path = filepath
             else:
                 raise ValueError(f"File must be .zip or .dat, got: {filepath.suffix}")
 
-            with dat_fp:
+            with open(dat_path, 'rb') as dat_fp:
                 data_header = dat_fp.read(header_size)
                 stock_header = struct.unpack(header_pack_format, data_header)
 
@@ -112,7 +108,7 @@ class Affair:
                 report_date = stock_header[1]
                 report_size = stock_header[4]
 
-                report_fields_count = int(report_size / 4)
+                report_fields_count = report_size // 4
                 report_pack_format = f'<{report_fields_count}f'
 
                 results = []

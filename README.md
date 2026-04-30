@@ -9,12 +9,16 @@
 
 ## Changelog
 
-### v1.1.3 (2026-04-30)
+### v1.1.4 (2026-04-30)
 
-修复 SonarCloud 安全审查项：测试文件移除硬编码 IP（改为引用 `consts.py`）；CI 收紧 tag 触发规则和权限声明。
+代码审查全量修复：Rust 协议层 market 参数统一为 `u8` 并修正 `get_transaction_data` 数据包长度；修复 `reader.rs` 分钟线日期解码与 `protocol.rs` 不一致；`affair.py` 文件句柄泄漏修复；`calendar.py` 网络失败增加日志警告；所有网络测试标记 `@pytest.mark.network`，CI 增加 test job。
 
 <details>
 <summary>历史版本</summary>
+
+**v1.1.3 (2026-04-30)**
+
+修复 SonarCloud 安全审查项：测试文件移除硬编码 IP（改为引用 `consts.py`）；CI 收紧 tag 触发规则和权限声明。
 
 **v1.1.2 (2026-04-30)**
 

@@ -169,13 +169,12 @@ pub fn read_minute_bars(py: Python<'_>, filepath: &str) -> PyResult<Vec<Py<PyAny
                 .map_err(|_| err("bad minute record"))?,
         );
 
-        // TDX minute date encoding:
+        // TDX minute date encoding (same as protocol.rs get_datetime):
         // year  = (raw_date >> 11) + 2004
-        // month = (raw_date >> 7) & 0x0F  (but value in range, may need % 100)
-        // day   = raw_date & 0x1F
+        // lower 11 bits = MM * 100 + DD (BCD-style)
         let year = (raw_date >> 11) + 2004;
-        let month = (raw_date >> 7) & 0x0F;
-        let day = raw_date & 0x1F;
+        let month = ((raw_date & 0x7FF) / 100) as u32;
+        let day = ((raw_date & 0x7FF) % 100) as u32;
 
         let hour = raw_time / 60;
         let minute = raw_time % 60;
