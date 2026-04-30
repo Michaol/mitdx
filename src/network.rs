@@ -47,6 +47,9 @@ const CMD_ID_F10_CATEGORY: u16 = 0x02cf;
 // Company info content (F10 内容) command
 const CMD_ID_F10_CONTENT: u16 = 0x02d0;
 
+// Finance info (财务信息) command
+const CMD_ID_FINANCE: u16 = 0x0010;
+
 /// Parse address string safely, returning a PyResult error on invalid input.
 fn parse_addr(addr: &str) -> PyResult<std::net::SocketAddr> {
     addr.parse().map_err(|e| {
@@ -816,6 +819,112 @@ impl TdxClient {
 
         let content = &data[pos..pos + content_length];
         Ok(decode_gbk(content))
+    }
+
+    // ===============================================================
+    //  get_finance_info  —  财务信息摘要
+    // ===============================================================
+    pub fn get_finance_info(
+        &mut self,
+        py: Python<'_>,
+        market: u8,
+        code: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
+
+        // Packet: 0c 1f 18 76 00 01 0b 00 0b 00 10 00 01 00 <B6s>
+        let mut req: Vec<u8> = vec![0x0c, 0x1f, 0x18, 0x76, 0x00, 0x01, 0x0b, 0x00, 0x0b, 0x00];
+        req.extend_from_slice(&CMD_ID_FINANCE.to_le_bytes());
+        req.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+        req.push(market);
+        req.extend_from_slice(&code_buf);
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        // Response: 2 bytes count + 7 bytes (market+code) + 136 bytes struct
+        // struct: <fHHIIffffffffffffffffffffffffffffff>
+        //   f32 + u16 + u16 + u32 + u32 + 29×f32 = 4+2+2+4+4+116 = 132... actually
+        //   1f + 2H + 2I + 29f = 4 + 4 + 8 + 116 = 132 bytes
+        let header_len = 2 + 7; // count(2) + market(1) + code(6)
+        if data.len() < header_len + 132 {
+            let dict = pyo3::types::PyDict::new(py);
+            return Ok(dict.into_any().unbind());
+        }
+
+        let pos = header_len;
+        let b = &data[pos..];
+
+        // Helper to read f32 at offset
+        let f = |off: usize| -> f64 {
+            f32::from_le_bytes(b[off..off + 4].try_into().unwrap_or([0; 4])) as f64
+        };
+        let h = |off: usize| -> u32 {
+            u16::from_le_bytes(b[off..off + 2].try_into().unwrap_or([0; 2])) as u32
+        };
+        let i = |off: usize| -> u32 {
+            u32::from_le_bytes(b[off..off + 4].try_into().unwrap_or([0; 4]))
+        };
+
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("market", market)?;
+        dict.set_item("code", code)?;
+
+        // f32 liutongguben (offset 0)
+        dict.set_item("liutongguben", f(0) * 10000.0)?;
+        // u16 province (offset 4)
+        dict.set_item("province", h(4))?;
+        // u16 industry (offset 6)
+        dict.set_item("industry", h(6))?;
+        // u32 updated_date (offset 8)
+        dict.set_item("updated_date", i(8))?;
+        // u32 ipo_date (offset 12)
+        dict.set_item("ipo_date", i(12))?;
+        // 29 x f32 starting at offset 16
+        let fields = [
+            "zongguben",
+            "guojiagu",
+            "faqirenfarengu",
+            "farengu",
+            "bgu",
+            "hgu",
+            "zhigonggu",
+            "zongzichan",
+            "liudongzichan",
+            "gudingzichan",
+            "wuxingzichan",
+            "gudongrenshu",
+            "liudongfuzhai",
+            "changqifuzhai",
+            "zibengongjijin",
+            "jingzichan",
+            "zhuyingshouru",
+            "zhuyinglirun",
+            "yingshouzhangkuan",
+            "yingyelirun",
+            "touzishouyu",
+            "jingyingxianjinliu",
+            "zongxianjinliu",
+            "cunhuo",
+            "lirunzonghe",
+            "shuihoulirun",
+            "jinglirun",
+            "weifenpeilirun",
+            "meigujingzichan",
+        ];
+        for (idx, name) in fields.iter().enumerate() {
+            let off = 16 + idx * 4;
+            let val = f(off);
+            // gudongrenshu and meigujingzichan are not scaled
+            if *name == "gudongrenshu" || *name == "meigujingzichan" {
+                dict.set_item(*name, val)?;
+            } else {
+                dict.set_item(*name, val * 10000.0)?;
+            }
+        }
+
+        Ok(dict.into_any().unbind())
     }
 }
 

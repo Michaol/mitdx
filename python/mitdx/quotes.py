@@ -171,11 +171,18 @@ class Quotes:
     # ---------------------------------------------------------------
     def finance(self, symbol: str = '600036', backend: str = 'pandas', **kwargs):
         """
-        Fetch financial data via TDX protocol. This is a convenience alias that
-        fetches XDXR data filtered to category=1 (dividend/rights events).
-        For full financial reports, use mitdx.affair.Affair.parse().
+        Fetch financial summary for a stock (流通股本, 总资产, 净利润 etc).
+        Returns a single-row DataFrame with 34 financial fields.
         """
-        return self.xdxr(symbol=symbol, backend=backend, **kwargs)
+        self._ensure_connected()
+        market = _market_code(symbol)
+        try:
+            res = self.client.get_finance_info(market=market, code=symbol)
+            return to_df([res], backend=backend)
+        except Exception as e:
+            logger.error(f"Failed to fetch finance: {e}")
+            self.disconnect()
+            raise
 
     # ---------------------------------------------------------------
     #  f10  —  F10 公司资料
