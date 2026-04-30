@@ -28,12 +28,12 @@ jobs:
       - name: Build wheel
         uses: PyO3/maturin-action@0dfb0f7f31bcd244f6aa4a4adb385f29bfa775b1 # v1.4.0
         with:
+          maturin-version: v1.13.0
           args: --release --out dist
       - name: Run tests
         run: |
           PIPCMD="pip"
-          $PIPCMD install --no-deps --only-binary :all: dist/*.whl
-          $PIPCMD install --only-binary :all: "pytest==8.4.1"
+          $PIPCMD install --only-binary :all: dist/*.whl "pytest==8.4.1"
           pytest -m "not network" -v
   linux:
     runs-on: ubuntu-latest
@@ -50,6 +50,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@0dfb0f7f31bcd244f6aa4a4adb385f29bfa775b1 # v1.4.0
         with:
+          maturin-version: v1.13.0
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
           manylinux: auto
@@ -75,6 +76,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@0dfb0f7f31bcd244f6aa4a4adb385f29bfa775b1 # v1.4.0
         with:
+          maturin-version: v1.13.0
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
       - name: Upload wheels
@@ -98,6 +100,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@0dfb0f7f31bcd244f6aa4a4adb385f29bfa775b1 # v1.4.0
         with:
+          maturin-version: v1.13.0
           target: ${{ matrix.target }}
           args: --release --out dist --find-interpreter
       - name: Upload wheels
@@ -115,6 +118,7 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@0dfb0f7f31bcd244f6aa4a4adb385f29bfa775b1 # v1.4.0
         with:
+          maturin-version: v1.13.0
           command: sdist
           args: --out dist
       - name: Upload sdist
@@ -139,5 +143,6 @@ jobs:
       - name: Publish to PyPI
         uses: PyO3/maturin-action@0dfb0f7f31bcd244f6aa4a4adb385f29bfa775b1 # v1.4.0
         with:
+          maturin-version: v1.13.0
           command: upload
           args: --non-interactive --skip-existing *
