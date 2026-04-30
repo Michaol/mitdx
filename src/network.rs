@@ -152,10 +152,10 @@ impl TdxClient {
         let mut req = Vec::with_capacity(38);
         req.extend_from_slice(&0x10c_u16.to_le_bytes());
         req.extend_from_slice(&0x01016408_u32.to_le_bytes());
-        req.extend_from_slice(&0x1b_u16.to_le_bytes()); // data length
-        req.extend_from_slice(&0x1b_u16.to_le_bytes()); // data length (dup)
+        req.extend_from_slice(&0x1c_u16.to_le_bytes()); // data length: 28 bytes
+        req.extend_from_slice(&0x1c_u16.to_le_bytes()); // data length (dup)
         req.extend_from_slice(&CMD_ID_BARS.to_le_bytes());
-        req.extend_from_slice(&market.to_le_bytes());
+        req.extend_from_slice(&(market as u16).to_le_bytes());
         req.extend_from_slice(&code_buf);
 
         req.extend_from_slice(&category.to_le_bytes());
@@ -492,10 +492,10 @@ impl TdxClient {
         let stream = self.require_stream()?;
         let code_buf = Self::code_bytes(code);
 
-        // Packet: 0c 17 08 01 01 01 0d 00 0d 00 c5 0f <B6sHH>
-        let mut req: Vec<u8> = vec![0x0c, 0x17, 0x08, 0x01, 0x01, 0x01, 0x0d, 0x00, 0x0d, 0x00];
+        // Packet: 0c 17 08 01 01 01 0e 00 0e 00 c5 0f <H6sHH>
+        let mut req: Vec<u8> = vec![0x0c, 0x17, 0x08, 0x01, 0x01, 0x01, 0x0e, 0x00, 0x0e, 0x00];
         req.extend_from_slice(&CMD_ID_TRANSACTION.to_le_bytes());
-        req.extend_from_slice(&market.to_le_bytes());
+        req.extend_from_slice(&(market as u16).to_le_bytes());
         req.extend_from_slice(&code_buf);
         req.extend_from_slice(&start.to_le_bytes());
         req.extend_from_slice(&count.to_le_bytes());
@@ -719,9 +719,9 @@ impl TdxClient {
         let code_buf = Self::code_bytes(code);
 
         // Packet: 0c 0f 10 9b 00 01 0e 00 0e 00 cf 02 <H6sI>
-        let mut req: Vec<u8> = vec![0x0c, 0x0f, 0x10, 0x9b, 0x00, 0x01, 0x0d, 0x00, 0x0d, 0x00];
+        let mut req: Vec<u8> = vec![0x0c, 0x0f, 0x10, 0x9b, 0x00, 0x01, 0x0e, 0x00, 0x0e, 0x00];
         req.extend_from_slice(&CMD_ID_F10_CATEGORY.to_le_bytes());
-        req.extend_from_slice(&market.to_le_bytes());
+        req.extend_from_slice(&(market as u16).to_le_bytes());
         req.extend_from_slice(&code_buf);
         req.extend_from_slice(&0u32.to_le_bytes());
 
@@ -793,7 +793,7 @@ impl TdxClient {
         // Packet: 0c 07 10 9c 00 01 68 00 68 00 d0 02 <H6sH80sIII>
         let mut req: Vec<u8> = vec![0x0c, 0x07, 0x10, 0x9c, 0x00, 0x01, 0x68, 0x00, 0x68, 0x00];
         req.extend_from_slice(&CMD_ID_F10_CONTENT.to_le_bytes());
-        req.extend_from_slice(&market.to_le_bytes());
+        req.extend_from_slice(&(market as u16).to_le_bytes());
         req.extend_from_slice(&code_buf);
         req.extend_from_slice(&0u16.to_le_bytes()); // padding
         req.extend_from_slice(&fname_buf);

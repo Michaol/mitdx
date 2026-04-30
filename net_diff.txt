@@ -1,0 +1,69 @@
+diff --git a/src/network.rs b/src/network.rs
+index c388e20..215ccc5 100644
+--- a/src/network.rs
++++ b/src/network.rs
+@@ -140,7 +140,7 @@ impl TdxClient {
+         &mut self,
+         py: Python<'_>,
+         category: u16,
+-        market: u16,
++        market: u8,
+         code: &str,
+         start: u16,
+         count: u16,
+@@ -484,7 +484,7 @@ impl TdxClient {
+     pub fn get_transaction_data(
+         &mut self,
+         py: Python<'_>,
+-        market: u16,
++        market: u8,
+         code: &str,
+         start: u16,
+         count: u16,
+@@ -492,8 +492,8 @@ impl TdxClient {
+         let stream = self.require_stream()?;
+         let code_buf = Self::code_bytes(code);
+ 
+-        // Packet: 0c 17 08 01 01 01 0e 00 0e 00 c5 0f <H6sHH>
+-        let mut req: Vec<u8> = vec![0x0c, 0x17, 0x08, 0x01, 0x01, 0x01, 0x0e, 0x00, 0x0e, 0x00];
++        // Packet: 0c 17 08 01 01 01 0d 00 0d 00 c5 0f <B6sHH>
++        let mut req: Vec<u8> = vec![0x0c, 0x17, 0x08, 0x01, 0x01, 0x01, 0x0d, 0x00, 0x0d, 0x00];
+         req.extend_from_slice(&CMD_ID_TRANSACTION.to_le_bytes());
+         req.extend_from_slice(&market.to_le_bytes());
+         req.extend_from_slice(&code_buf);
+@@ -686,6 +686,9 @@ impl TdxClient {
+             }
+ 
+             // trailing bytes: u16 + 4*get_price + (i16 + u16)
++            if pos >= data.len() {
++                break;
++            }
+             if pos + 2 <= data.len() {
+                 pos += 2;
+             }
+@@ -709,7 +712,7 @@ impl TdxClient {
+     pub fn get_company_info_category(
+         &mut self,
+         py: Python<'_>,
+-        market: u16,
++        market: u8,
+         code: &str,
+     ) -> PyResult<Vec<Py<PyAny>>> {
+         let stream = self.require_stream()?;
+@@ -772,7 +775,7 @@ impl TdxClient {
+     // ===============================================================
+     pub fn get_company_info_content(
+         &mut self,
+-        market: u16,
++        market: u8,
+         code: &str,
+         filename: &str,
+         start: u32,
+@@ -806,6 +809,7 @@ impl TdxClient {
+         }
+ 
+         // skip 10 bytes, then read content_length u16
++        // Note: TDX protocol limits F10 content to 64KB per request (u16 wire field).
+         let content_length = u16::from_le_bytes(data[10..12].try_into().map_err(|_| {
+             pyo3::exceptions::PyRuntimeError::new_err("Malformed F10 content header")
+         })?) as usize;

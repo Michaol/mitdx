@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:www.githubstatus.com)",
+      "WebFetch(domain:status.github.com)",
+      "Bash(.venv/Scripts/python -m pytest tests/test_reader.py tests/test_calendar.py -v)",
+      "Bash(.venv/Scripts/maturin develop *)",
+      "Bash(.venv/Scripts/python -m pytest tests/test_reader.py tests/test_calendar.py tests/test_affair.py -v)",
+      "Bash(.venv/Scripts/python -m pytest -m \"not network\" -v)",
+      "Bash(.venv/Scripts/python -c \"import mitdx; print\\(mitdx.__version__\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git tag *)",
+      "Bash(gh run *)",
+      "Bash(pip download *)",
+      "Bash(pip hash *)",
+      "Bash(xargs -I{} gh run watch {} --exit-status)",
+      "Bash(xargs -I{} gh run view {} --json jobs -q '.jobs[] | \"\\\\\\(.name\\): \\\\\\(.conclusion\\)\"')",
+      "Bash(maturin develop *)",
+      "Bash(python -m pytest tests/ -m \"not network\" -v)"
+    ]
+  }
+}

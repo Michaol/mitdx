@@ -9,9 +9,10 @@
 
 ## Changelog
 
-### v1.1.5 (2026-04-30)
+### v1.1.6 (2026-04-30)
 
-修复 v1.1.4 回归：`get_security_bars`、`get_company_info_category` 数据包头 data_len 未随 `market` 从 `u16` 缩减为 `u8` 同步更新，导致服务端等待多余字节超时（EAGAIN）。CI 工作流加固：test job 改用 `maturin build` + `pip install`；权限最小化；SonarCloud 警告修复。
+修复 1.1.4/1.1.5 严重核心回归：重构后 `get_security_bars`、`get_company_info_category`、`get_transaction_data` 结构化请求时由包头数据长度与实际写入长度不匹配阻碍服务端响应导致的 EAGAIN Socket 超时挂起，现已将被强转为 `u8` 的 `market` 字段在底层通信层恢复回原生的 `u16` 二字节结构，对齐发包长度完美解决。
+同步彻底修复 MacOS (aarch64) 版本 CI 构建时由于跨缓存损坏引起的 `sccache` 序列化警告反序列化报错（已在 Actions 环境静默绕过并配置禁用 sccache）。
 
 <details>
 <summary>历史版本</summary>
