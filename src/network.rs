@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::protocol::{get_datetime, get_price, get_volume};
+use crate::protocol::{get_datetime, get_price, get_time, get_volume};
 
 const CONNECT_TIMEOUT: u64 = 5;
 const READ_TIMEOUT: u64 = 10;
@@ -31,6 +31,21 @@ const SETUP_CMD3: [u8; 42] = [
 
 // K-line bars request command
 const CMD_ID_BARS: u16 = 0x052d;
+
+// XDXR (除权除息) request command
+const CMD_ID_XDXR: u16 = 0x000f;
+
+// Transaction (分笔成交) request command
+const CMD_ID_TRANSACTION: u16 = 0x0fc5;
+
+// Security quotes (实时行情快照) command
+const CMD_ID_QUOTES: u32 = 0x5053e;
+
+// Company info category (F10 目录) command
+const CMD_ID_F10_CATEGORY: u16 = 0x02cf;
+
+// Company info content (F10 内容) command
+const CMD_ID_F10_CONTENT: u16 = 0x02d0;
 
 /// Parse address string safely, returning a PyResult error on invalid input.
 fn parse_addr(addr: &str) -> PyResult<std::net::SocketAddr> {
@@ -127,14 +142,8 @@ impl TdxClient {
         start: u16,
         count: u16,
     ) -> PyResult<Vec<Py<PyAny>>> {
-        let stream = match self.stream.as_mut() {
-            Some(s) => s,
-            None => {
-                return Err(pyo3::exceptions::PyConnectionError::new_err(
-                    "Not connected",
-                ))
-            }
-        };
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
 
         // Build request packet
         let mut req = Vec::with_capacity(38);
@@ -144,13 +153,7 @@ impl TdxClient {
         req.extend_from_slice(&0x1c_u16.to_le_bytes()); // data length (dup)
         req.extend_from_slice(&CMD_ID_BARS.to_le_bytes());
         req.extend_from_slice(&market.to_le_bytes());
-
-        // Stock code: 6 ASCII bytes, zero-padded
-        let mut code_bytes = [0u8; 6];
-        let cd = code.as_bytes();
-        let len = std::cmp::min(6, cd.len());
-        code_bytes[..len].copy_from_slice(&cd[..len]);
-        req.extend_from_slice(&code_bytes);
+        req.extend_from_slice(&code_buf);
 
         req.extend_from_slice(&category.to_le_bytes());
         req.extend_from_slice(&1u16.to_le_bytes()); // unknown flag
@@ -161,32 +164,7 @@ impl TdxClient {
         req.extend_from_slice(&0u16.to_le_bytes()); // reserved
 
         stream.write_all(&req)?;
-
-        // Read response header
-        let mut header = [0u8; RESP_HEADER_LEN];
-        stream.read_exact(&mut header)?;
-
-        let zip_size =
-            u16::from_le_bytes(header[12..14].try_into().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("Malformed response header")
-            })?);
-        let unzip_size =
-            u16::from_le_bytes(header[14..16].try_into().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("Malformed response header")
-            })?);
-
-        let mut body = vec![0u8; zip_size as usize];
-        stream.read_exact(&mut body)?;
-
-        // Decompress if needed
-        let data = if zip_size != unzip_size {
-            let mut decoder = ZlibDecoder::new(&body[..]);
-            let mut unzipped = vec![0u8; unzip_size as usize];
-            decoder.read_exact(&mut unzipped)?;
-            unzipped
-        } else {
-            body
-        };
+        let data = Self::read_response(stream)?;
 
         if data.len() < 2 {
             return Ok(vec![]);
@@ -268,14 +246,7 @@ impl TdxClient {
         filename: &str,
         offset: u32,
     ) -> PyResult<(u32, std::borrow::Cow<'_, [u8]>)> {
-        let stream = match self.stream.as_mut() {
-            Some(s) => s,
-            None => {
-                return Err(pyo3::exceptions::PyConnectionError::new_err(
-                    "Not connected",
-                ))
-            }
-        };
+        let stream = self.require_stream()?;
 
         // Build report file request packet
         let mut req = Vec::with_capacity(120);
@@ -296,8 +267,25 @@ impl TdxClient {
         req.extend_from_slice(&fname_buf);
 
         stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
 
-        // Read response header
+        if data.len() < 4 {
+            return Ok((0, std::borrow::Cow::Borrowed(&[])));
+        }
+
+        let chunk_size =
+            u32::from_le_bytes(data[0..4].try_into().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("Malformed chunk header")
+            })?);
+        Ok((chunk_size, std::borrow::Cow::Owned(data[4..].to_vec())))
+    }
+}
+
+// ---------------------------------------------------------------
+//  Private (non-PyO3) helpers on TdxClient
+// ---------------------------------------------------------------
+impl TdxClient {
+    fn read_response(stream: &mut TcpStream) -> PyResult<Vec<u8>> {
         let mut header = [0u8; RESP_HEADER_LEN];
         stream.read_exact(&mut header)?;
 
@@ -315,24 +303,525 @@ impl TdxClient {
             stream.read_exact(&mut body)?;
         }
 
-        // Decompress if needed
-        let data = if zip_size != unzip_size {
+        if zip_size != unzip_size {
             let mut decoder = ZlibDecoder::new(&body[..]);
             let mut unzipped = vec![0u8; unzip_size as usize];
             decoder.read_exact(&mut unzipped)?;
-            unzipped
+            Ok(unzipped)
         } else {
-            body
-        };
+            Ok(body)
+        }
+    }
 
-        if data.len() < 4 {
-            return Ok((0, std::borrow::Cow::Borrowed(&[])));
+    // ---------------------------------------------------------------
+    //  Helper: get connected stream or return PyConnectionError
+    // ---------------------------------------------------------------
+    fn require_stream(&mut self) -> PyResult<&mut TcpStream> {
+        self.stream
+            .as_mut()
+            .ok_or_else(|| pyo3::exceptions::PyConnectionError::new_err("Not connected"))
+    }
+
+    // ---------------------------------------------------------------
+    //  Helper: build 6-byte zero-padded stock code
+    // ---------------------------------------------------------------
+    fn code_bytes(code: &str) -> [u8; 6] {
+        let mut buf = [0u8; 6];
+        let cd = code.as_bytes();
+        let len = std::cmp::min(6, cd.len());
+        buf[..len].copy_from_slice(&cd[..len]);
+        buf
+    }
+}
+
+// ===============================================================
+//  New protocol methods exposed to Python
+// ===============================================================
+#[pymethods]
+impl TdxClient {
+    // ===============================================================
+    //  get_xdxr_info  —  除权除息信息
+    // ===============================================================
+    pub fn get_xdxr_info(
+        &mut self,
+        py: Python<'_>,
+        market: u8,
+        code: &str,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
+
+        // Packet: 0c 1f 18 76 00 01 0b 00 0b 00 0f 00 01 00 <B6s>
+        let mut req: Vec<u8> = vec![0x0c, 0x1f, 0x18, 0x76, 0x00, 0x01, 0x0b, 0x00, 0x0b, 0x00];
+        req.extend_from_slice(&CMD_ID_XDXR.to_le_bytes());
+        req.extend_from_slice(&1u16.to_le_bytes()); // count = 1
+        req.push(market);
+        req.extend_from_slice(&code_buf);
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 11 {
+            return Ok(vec![]);
         }
 
-        let chunk_size =
-            u32::from_le_bytes(data[0..4].try_into().map_err(|_| {
-                pyo3::exceptions::PyRuntimeError::new_err("Malformed chunk header")
-            })?);
-        Ok((chunk_size, std::borrow::Cow::Owned(data[4..].to_vec())))
+        let mut pos: usize = 9; // skip 9 preamble bytes
+        if pos + 2 > data.len() {
+            return Ok(vec![]);
+        }
+        let num = u16::from_le_bytes(
+            data[pos..pos + 2]
+                .try_into()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Malformed xdxr count"))?,
+        );
+        pos += 2;
+
+        let mut results = Vec::with_capacity(num as usize);
+
+        for _ in 0..num {
+            // skip market(1) + code(6) = 7  +  1 reserved byte
+            if pos + 8 > data.len() {
+                break;
+            }
+            pos += 8;
+
+            // datetime: category 9 means date-only
+            let (year, month, day, _hour, _minute, new_pos) = match get_datetime(9, &data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+
+            if pos >= data.len() {
+                break;
+            }
+            let category = data[pos];
+            pos += 1;
+
+            // 16 bytes of category-specific floats / ints
+            if pos + 16 > data.len() {
+                break;
+            }
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("year", year)?;
+            dict.set_item("month", month)?;
+            dict.set_item("day", day)?;
+            dict.set_item("category", category)?;
+
+            let cat_name = match category {
+                1 => "除权除息",
+                2 => "送配股上市",
+                3 => "非流通股上市",
+                4 => "未知股本变动",
+                5 => "股本变化",
+                6 => "增发新股",
+                7 => "股份回购",
+                8 => "增发新股上市",
+                9 => "转配股上市",
+                10 => "可转债上市",
+                11 => "扩缩股",
+                12 => "非流通股缩股",
+                13 => "送认购权证",
+                14 => "送认沽权证",
+                _ => "未知",
+            };
+            dict.set_item("name", cat_name)?;
+
+            if category == 1 {
+                // fenhong, peigujia, songzhuangu, peigu  (4 x f32)
+                let fenhong = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4]));
+                let peigujia =
+                    f32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap_or([0; 4]));
+                let songzhuangu =
+                    f32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap_or([0; 4]));
+                let peigu =
+                    f32::from_le_bytes(data[pos + 12..pos + 16].try_into().unwrap_or([0; 4]));
+                dict.set_item("fenhong", fenhong)?;
+                dict.set_item("peigujia", peigujia)?;
+                dict.set_item("songzhuangu", songzhuangu)?;
+                dict.set_item("peigu", peigu)?;
+            } else if category == 11 || category == 12 {
+                // _, _, suogu, _  (u32, u32, f32, u32)
+                let suogu =
+                    f32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap_or([0; 4]));
+                dict.set_item("suogu", suogu)?;
+            } else if category == 13 || category == 14 {
+                // xingquanjia, _, fenshu, _  (f32, u32, f32, u32)
+                let xingquanjia =
+                    f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4]));
+                let fenshu =
+                    f32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap_or([0; 4]));
+                dict.set_item("xingquanjia", xingquanjia)?;
+                dict.set_item("fenshu", fenshu)?;
+            } else {
+                // panqianliutong, qianzongguben, panhouliutong, houzongguben (4 x u32 -> get_volume)
+                let raw0 = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4]));
+                let raw1 = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap_or([0; 4]));
+                let raw2 = u32::from_le_bytes(data[pos + 8..pos + 12].try_into().unwrap_or([0; 4]));
+                let raw3 =
+                    u32::from_le_bytes(data[pos + 12..pos + 16].try_into().unwrap_or([0; 4]));
+                let v = |r: u32| if r == 0 { 0.0 } else { get_volume(r) };
+                dict.set_item("panqianliutong", v(raw0))?;
+                dict.set_item("qianzongguben", v(raw1))?;
+                dict.set_item("panhouliutong", v(raw2))?;
+                dict.set_item("houzongguben", v(raw3))?;
+            }
+            pos += 16;
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
     }
+
+    // ===============================================================
+    //  get_transaction_data  —  分笔成交
+    // ===============================================================
+    pub fn get_transaction_data(
+        &mut self,
+        py: Python<'_>,
+        market: u16,
+        code: &str,
+        start: u16,
+        count: u16,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
+
+        // Packet: 0c 17 08 01 01 01 0e 00 0e 00 c5 0f <H6sHH>
+        let mut req: Vec<u8> = vec![0x0c, 0x17, 0x08, 0x01, 0x01, 0x01, 0x0e, 0x00, 0x0e, 0x00];
+        req.extend_from_slice(&CMD_ID_TRANSACTION.to_le_bytes());
+        req.extend_from_slice(&market.to_le_bytes());
+        req.extend_from_slice(&code_buf);
+        req.extend_from_slice(&start.to_le_bytes());
+        req.extend_from_slice(&count.to_le_bytes());
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 2 {
+            return Ok(vec![]);
+        }
+
+        let num = u16::from_le_bytes(
+            data[0..2]
+                .try_into()
+                .map_err(|_| pyo3::exceptions::PyRuntimeError::new_err("Malformed tick count"))?,
+        );
+        let mut pos: usize = 2;
+        let mut last_price: i64 = 0;
+        let mut results = Vec::with_capacity(num as usize);
+
+        for _ in 0..num {
+            let (hour, minute, new_pos) = match get_time(&data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+
+            let (price_raw, p1) = get_price(&data, pos);
+            pos = p1;
+            let (vol, p2) = get_price(&data, pos);
+            pos = p2;
+            let (num_trades, p3) = get_price(&data, pos);
+            pos = p3;
+            let (buyorsell, p4) = get_price(&data, pos);
+            pos = p4;
+            let (_reserved, p5) = get_price(&data, pos);
+            pos = p5;
+
+            last_price += price_raw;
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("time", format!("{:02}:{:02}", hour, minute))?;
+            dict.set_item("price", (last_price as f64) / 100.0)?;
+            dict.set_item("vol", vol)?;
+            dict.set_item("num", num_trades)?;
+            dict.set_item("buyorsell", buyorsell)?;
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
+    }
+
+    // ===============================================================
+    //  get_security_quotes  —  实时行情快照 (五档盘口)
+    // ===============================================================
+    pub fn get_security_quotes(
+        &mut self,
+        py: Python<'_>,
+        stock_list: Vec<(u8, String)>,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.require_stream()?;
+        let stock_len = stock_list.len();
+        if stock_len == 0 {
+            return Ok(vec![]);
+        }
+
+        let pkg_data_len = (stock_len * 7 + 12) as u16;
+
+        let mut req = Vec::with_capacity(20 + stock_len * 7);
+        req.extend_from_slice(&0x10c_u16.to_le_bytes());
+        req.extend_from_slice(&0x02006320_u32.to_le_bytes());
+        req.extend_from_slice(&pkg_data_len.to_le_bytes());
+        req.extend_from_slice(&pkg_data_len.to_le_bytes());
+        req.extend_from_slice(&CMD_ID_QUOTES.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes());
+        req.extend_from_slice(&0u16.to_le_bytes());
+        req.extend_from_slice(&(stock_len as u16).to_le_bytes());
+
+        for (market, code) in &stock_list {
+            req.push(*market);
+            let cb = Self::code_bytes(code);
+            req.extend_from_slice(&cb);
+        }
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 4 {
+            return Ok(vec![]);
+        }
+
+        // skip 2 bytes (b1 cb), then read count
+        let mut pos: usize = 2;
+        let num_stock =
+            u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
+                pyo3::exceptions::PyRuntimeError::new_err("Malformed quotes count")
+            })?);
+        pos += 2;
+
+        let mut results = Vec::with_capacity(num_stock as usize);
+
+        for _ in 0..num_stock {
+            if pos + 9 > data.len() {
+                break;
+            }
+            let market = data[pos];
+            let code_raw = &data[pos + 1..pos + 7];
+            let code_str = std::str::from_utf8(code_raw)
+                .unwrap_or("")
+                .trim_end_matches('\0');
+            // active1 = u16 at pos+7..pos+9, skip
+            pos += 9;
+
+            let (price, p1) = get_price(&data, pos);
+            pos = p1;
+            let (last_close_diff, p2) = get_price(&data, pos);
+            pos = p2;
+            let (open_diff, p3) = get_price(&data, pos);
+            pos = p3;
+            let (high_diff, p4) = get_price(&data, pos);
+            pos = p4;
+            let (low_diff, p5) = get_price(&data, pos);
+            pos = p5;
+
+            // server time (get_price), reversed_bytes1 (get_price)
+            let (server_time_raw, p6) = get_price(&data, pos);
+            pos = p6;
+            let (_rb1, p7) = get_price(&data, pos);
+            pos = p7;
+
+            // vol, cur_vol
+            let (vol, p8) = get_price(&data, pos);
+            pos = p8;
+            let (cur_vol, p9) = get_price(&data, pos);
+            pos = p9;
+
+            // amount (u32 -> get_volume)
+            if pos + 4 > data.len() {
+                break;
+            }
+            let amount_raw = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap_or([0; 4]));
+            let amount = get_volume(amount_raw);
+            pos += 4;
+
+            // s_vol, b_vol, rb2, rb3
+            let (s_vol, pa) = get_price(&data, pos);
+            pos = pa;
+            let (b_vol, pb) = get_price(&data, pos);
+            pos = pb;
+            let (_rb2, pc) = get_price(&data, pos);
+            pos = pc;
+            let (_rb3, pd) = get_price(&data, pos);
+            pos = pd;
+
+            let cal = |base: i64, diff: i64| -> f64 { (base + diff) as f64 / 100.0 };
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("market", market)?;
+            dict.set_item("code", code_str)?;
+            dict.set_item("price", cal(price, 0))?;
+            dict.set_item("last_close", cal(price, last_close_diff))?;
+            dict.set_item("open", cal(price, open_diff))?;
+            dict.set_item("high", cal(price, high_diff))?;
+            dict.set_item("low", cal(price, low_diff))?;
+            dict.set_item("servertime", server_time_raw)?;
+            dict.set_item("vol", vol)?;
+            dict.set_item("cur_vol", cur_vol)?;
+            dict.set_item("amount", amount)?;
+            dict.set_item("s_vol", s_vol)?;
+            dict.set_item("b_vol", b_vol)?;
+
+            // 5-level bid/ask
+            for level in 1..=5u8 {
+                let (bid, pe) = get_price(&data, pos);
+                pos = pe;
+                let (ask, pf) = get_price(&data, pos);
+                pos = pf;
+                let (bid_vol, pg) = get_price(&data, pos);
+                pos = pg;
+                let (ask_vol, ph) = get_price(&data, pos);
+                pos = ph;
+
+                dict.set_item(format!("bid{}", level), cal(price, bid))?;
+                dict.set_item(format!("ask{}", level), cal(price, ask))?;
+                dict.set_item(format!("bid_vol{}", level), bid_vol)?;
+                dict.set_item(format!("ask_vol{}", level), ask_vol)?;
+            }
+
+            // trailing bytes: u16 + 4*get_price + (i16 + u16)
+            if pos + 2 <= data.len() {
+                pos += 2;
+            }
+            for _ in 0..4 {
+                let (_, pn) = get_price(&data, pos);
+                pos = pn;
+            }
+            if pos + 4 <= data.len() {
+                pos += 4;
+            }
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
+    }
+
+    // ===============================================================
+    //  get_company_info_category  —  F10 公司资料目录
+    // ===============================================================
+    pub fn get_company_info_category(
+        &mut self,
+        py: Python<'_>,
+        market: u16,
+        code: &str,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
+
+        // Packet: 0c 0f 10 9b 00 01 0e 00 0e 00 cf 02 <H6sI>
+        let mut req: Vec<u8> = vec![0x0c, 0x0f, 0x10, 0x9b, 0x00, 0x01, 0x0e, 0x00, 0x0e, 0x00];
+        req.extend_from_slice(&CMD_ID_F10_CATEGORY.to_le_bytes());
+        req.extend_from_slice(&market.to_le_bytes());
+        req.extend_from_slice(&code_buf);
+        req.extend_from_slice(&0u32.to_le_bytes());
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 2 {
+            return Ok(vec![]);
+        }
+
+        let num = u16::from_le_bytes(data[0..2].try_into().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("Malformed F10 category count")
+        })?);
+        let mut pos: usize = 2;
+        let mut results = Vec::with_capacity(num as usize);
+
+        for _ in 0..num {
+            if pos + 152 > data.len() {
+                break;
+            }
+            // name: 64 bytes (GBK), filename: 80 bytes (ASCII), start: u32, length: u32
+            let name_raw = &data[pos..pos + 64];
+            let filename_raw = &data[pos + 64..pos + 144];
+            let start_offset =
+                u32::from_le_bytes(data[pos + 144..pos + 148].try_into().unwrap_or([0; 4]));
+            let length =
+                u32::from_le_bytes(data[pos + 148..pos + 152].try_into().unwrap_or([0; 4]));
+            pos += 152;
+
+            // Decode GBK name (trim nulls)
+            let null_pos_n = name_raw.iter().position(|&b| b == 0).unwrap_or(64);
+            let name = decode_gbk(&name_raw[..null_pos_n]);
+
+            let null_pos_f = filename_raw.iter().position(|&b| b == 0).unwrap_or(80);
+            let filename = String::from_utf8_lossy(&filename_raw[..null_pos_f]).to_string();
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("name", name)?;
+            dict.set_item("filename", filename)?;
+            dict.set_item("start", start_offset)?;
+            dict.set_item("length", length)?;
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
+    }
+
+    // ===============================================================
+    //  get_company_info_content  —  F10 公司资料内容
+    // ===============================================================
+    pub fn get_company_info_content(
+        &mut self,
+        market: u16,
+        code: &str,
+        filename: &str,
+        start: u32,
+        length: u32,
+    ) -> PyResult<String> {
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
+
+        // filename: 80 bytes zero-padded
+        let mut fname_buf = [0u8; 80];
+        let fb = filename.as_bytes();
+        let flen = std::cmp::min(80, fb.len());
+        fname_buf[..flen].copy_from_slice(&fb[..flen]);
+
+        // Packet: 0c 07 10 9c 00 01 68 00 68 00 d0 02 <H6sH80sIII>
+        let mut req: Vec<u8> = vec![0x0c, 0x07, 0x10, 0x9c, 0x00, 0x01, 0x68, 0x00, 0x68, 0x00];
+        req.extend_from_slice(&CMD_ID_F10_CONTENT.to_le_bytes());
+        req.extend_from_slice(&market.to_le_bytes());
+        req.extend_from_slice(&code_buf);
+        req.extend_from_slice(&0u16.to_le_bytes()); // padding
+        req.extend_from_slice(&fname_buf);
+        req.extend_from_slice(&start.to_le_bytes());
+        req.extend_from_slice(&length.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 12 {
+            return Ok(String::new());
+        }
+
+        // skip 10 bytes, then read content_length u16
+        let content_length = u16::from_le_bytes(data[10..12].try_into().map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err("Malformed F10 content header")
+        })?) as usize;
+        let pos = 12;
+
+        if pos + content_length > data.len() {
+            // return what we can
+            let content = &data[pos..];
+            return Ok(decode_gbk(content));
+        }
+
+        let content = &data[pos..pos + content_length];
+        Ok(decode_gbk(content))
+    }
+}
+
+/// Decode a GBK-encoded byte slice to a String.
+/// Falls back to lossy UTF-8 if GBK decoding fails.
+fn decode_gbk(bytes: &[u8]) -> String {
+    let (cow, _, _) = encoding_rs::GBK.decode(bytes);
+    cow.into_owned()
 }

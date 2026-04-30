@@ -123,3 +123,16 @@ pub fn get_datetime(
 
     Some((year, month, day, hour, minute, pos))
 }
+
+/// Helper to decode HH:MM time from u16.
+/// Returns (hour, minute, pos)
+pub fn get_time(data: &[u8], mut pos: usize) -> Option<(u32, u32, usize)> {
+    if pos + 2 > data.len() {
+        return None;
+    }
+    let tminutes = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?);
+    let hour = (tminutes / 60) as u32;
+    let minute = (tminutes % 60) as u32;
+    pos += 2;
+    Some((hour, minute, pos))
+}
