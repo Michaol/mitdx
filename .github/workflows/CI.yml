@@ -27,7 +27,7 @@ jobs:
       - name: Build and install
         uses: PyO3/maturin-action@0dfb0f7f31bcd244f6aa4a4adb385f29bfa775b1 # v1.4.0
         with:
-          args: --release
+          args: develop --release
           sccache: "true"
       - name: Run tests
         run: |
@@ -120,7 +120,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: "startsWith(github.ref, 'refs/tags/')"
-    needs: [linux, windows, macos, sdist]
+    needs: [test, linux, windows, macos, sdist]
     permissions:
       contents: write
       id-token: write
