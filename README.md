@@ -9,12 +9,16 @@
 
 ## Changelog
 
-### v1.1.4 (2026-04-30)
+### v1.1.5 (2026-04-30)
 
-代码审查全量修复：Rust 协议层 market 参数统一为 `u8` 并修正 `get_transaction_data` 数据包长度；修复 `reader.rs` 分钟线日期解码与 `protocol.rs` 不一致；`affair.py` 文件句柄泄漏修复；`calendar.py` 网络失败增加日志警告；所有网络测试标记 `@pytest.mark.network`，CI 增加 test job。
+修复 v1.1.4 回归：`get_security_bars`、`get_company_info_category` 数据包头 data_len 未随 `market` 从 `u16` 缩减为 `u8` 同步更新，导致服务端等待多余字节超时（EAGAIN）。CI 工作流加固：test job 改用 `maturin build` + `pip install`；权限最小化；SonarCloud 警告修复。
 
 <details>
 <summary>历史版本</summary>
+
+**v1.1.4 (2026-04-30)**
+
+代码审查全量修复：Rust 协议层 market 参数统一为 `u8` 并修正 `get_transaction_data` 数据包长度；修复 `reader.rs` 分钟线日期解码与 `protocol.rs` 不一致；`affair.py` 文件句柄泄漏修复；`calendar.py` 网络失败增加日志警告；所有网络测试标记 `@pytest.mark.network`，CI 增加 test job。
 
 **v1.1.3 (2026-04-30)**
 
