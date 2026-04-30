@@ -1,10 +1,10 @@
 import pytest
 import datetime
 from mitdx._core import TdxClient
+from mitdx.consts import HQ_HOSTS
 
-# known stable public TDX server for testing
-TEST_SERVER_IP = "110.41.147.114"  # 深圳双线主站1
-TEST_SERVER_PORT = 7709
+# Use first configured HQ host for testing
+_name, TEST_SERVER_IP, TEST_SERVER_PORT = HQ_HOSTS[0]
 
 
 def test_tdx_client_connect():

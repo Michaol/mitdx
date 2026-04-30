@@ -1,5 +1,5 @@
 # Static list of HQ (行情) hosts for real-time quotes
-HQ_HOSTS = [
+HQ_HOSTS = [  # NOSONAR - server address configuration, not credentials
     # (name, ip, port)
     ('深圳双线主站1', '110.41.147.114', 7709),
     ('深圳双线主站2', '8.129.13.54', 7709),
