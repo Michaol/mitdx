@@ -1,6 +1,6 @@
 [package]
 name = "mitdx"
-version = "1.1.6"
+version = "1.1.7"
 edition = "2021"
 description = "High-performance TDX market data reader for Python, powered by Rust"
 
