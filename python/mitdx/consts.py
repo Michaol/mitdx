@@ -1,3 +1,10 @@
+# Market codes
+MARKET_SZ = 0  # 深圳
+MARKET_SH = 1  # 上海
+
+# Security list batch size (TDX protocol limit per request)
+SECURITY_LIST_BATCH_SIZE = 1000
+
 # Static list of HQ (行情) hosts for real-time quotes
 HQ_HOSTS = [  # NOSONAR - server address configuration, not credentials
     # (name, ip, port)

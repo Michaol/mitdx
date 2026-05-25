@@ -7,15 +7,43 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=Michaol_mitdx&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=Michaol_mitdx)
 
+## 支持的 TDX 协议
+
+| 协议                        | 指令      | 功能                | Python API          |
+| --------------------------- | --------- | ------------------- | ------------------- |
+| `get_security_count`        | `0x044E`  | 市场证券数量        | `stock_count()`     |
+| `get_security_list`         | `0x0450`  | 证券列表 (代码/名称)| `stocks()` `stock_all()` |
+| `get_security_bars`         | `0x052D`  | K 线数据            | `bars()` `minute()` `index()` |
+| `get_security_quotes`       | `0x5053E` | 实时五档盘口        | `quotes()`          |
+| `get_transaction_data`      | `0x0FC5`  | 分笔成交            | `transactions()`    |
+| `get_xdxr_info`             | `0x000F`  | 除权除息            | `xdxr()`            |
+| `get_finance_info`          | `0x0010`  | 财务摘要            | `finance()`         |
+| `get_company_info_category` | `0x02CF`  | F10 公司资料目录    | `f10()`             |
+| `get_company_info_content`  | `0x02D0`  | F10 公司资料内容    | `f10()`             |
+| `get_report_file`           | `0x06B9`  | 报表文件下载        | —                   |
+
 ## Changelog
 
-### v1.1.7 (2026-04-30)
+### v1.1.8 (2026-05-25)
 
-修复 1.1.4/1.1.5 严重核心回归：重构后 `get_security_bars`、`get_company_info_category`、`get_transaction_data` 结构化请求时由包头数据长度与实际写入长度不匹配阻碍服务端响应导致的 EAGAIN Socket 超时挂起，现已将被强转为 `u8` 的 `market` 字段在底层通信层恢复回原生的 `u16` 二字节结构，对齐发包长度完美解决。
-同步彻底修复 MacOS (aarch64) 版本 CI 构建时由于跨缓存损坏引起的 `sccache` 序列化警告反序列化报错（已在 Actions 环境静默绕过并配置禁用 sccache）。
+新增 TDX 协议 `GetSecurityCount` / `GetSecurityList` 命令，支持从通达信服务器获取全量股票代码与名称映射。
+
+| 新增协议              | 指令     | 功能                                |
+| --------------------- | -------- | ----------------------------------- |
+| `get_security_count`  | `0x044E` | 获取市场证券数量                    |
+| `get_security_list`   | `0x0450` | 获取证券列表 (代码/名称/昨收等)     |
+
+新增 Python API：`stock_count()` · `stocks()` · `stock_all()`
+
+其他：Rust 层新增 `parse_u16_le()` / `parse_u32_le()` 辅助函数消除重复；Python 层新增 `MARKET_SH` / `MARKET_SZ` / `SECURITY_LIST_BATCH_SIZE` 常量；`stock_all()` 与 `stocks()` 分页逻辑去重；全量 `logger.exception()` 替换 `logger.error()` 保留堆栈跟踪；市场参数校验与 mootdx API 兼容。
 
 <details>
 <summary>历史版本</summary>
+
+**v1.1.7 (2026-04-30)**
+
+修复 1.1.4/1.1.5 严重核心回归：重构后 `get_security_bars`、`get_company_info_category`、`get_transaction_data` 结构化请求时由包头数据长度与实际写入长度不匹配阻碍服务端响应导致的 EAGAIN Socket 超时挂起，现已将被强转为 `u8` 的 `market` 字段在底层通信层恢复回原生的 `u16` 二字节结构，对齐发包长度完美解决。
+同步彻底修复 MacOS (aarch64) 版本 CI 构建时由于跨缓存损坏引起的 `sccache` 序列化警告反序列化报错（已在 Actions 环境静默绕过并配置禁用 sccache）。
 
 **v1.1.4 (2026-04-30)**
 
@@ -97,16 +125,23 @@ df = reader.fzline(symbol='600036')              # 5分钟线
 
 ```python
 from mitdx.quotes import Quotes
+from mitdx.consts import MARKET_SH, MARKET_SZ
 
 with Quotes.factory(market='std') as q:
-    df = q.bars(symbol='600036', frequency=9, count=20)           # K线
-    df = q.minute(symbol='600036', frequency=0, count=20)         # 分钟线 (bars 别名)
-    df = q.index(symbol='000001', frequency=9, count=20)          # 指数 (bars 别名)
-    df = q.xdxr(symbol='600036')                                  # 除权除息
-    df = q.transactions(symbol='600036', start=0, count=30)       # 分笔成交
-    df = q.quotes(symbols=['600036', '000001'])                   # 实时快照 (批量)
-    df = q.finance(symbol='600036')                               # 财务数据 (xdxr 别名)
-    info = q.f10(symbol='600036')                                 # F10 公司资料
+    # 证券列表
+    count = q.stock_count(market=MARKET_SH)                     # 市场证券数量
+    df = q.stocks(market=MARKET_SH)                              # 单市场证券列表 (自动分页)
+    df = q.stock_all()                                           # 沪深全量证券列表
+
+    # 行情数据
+    df = q.bars(symbol='600036', frequency=9, count=20)          # K线
+    df = q.minute(symbol='600036', frequency=0, count=20)        # 分钟线 (bars 别名)
+    df = q.index(symbol='000001', frequency=9, count=20)         # 指数 (bars 别名)
+    df = q.xdxr(symbol='600036')                                 # 除权除息
+    df = q.transactions(symbol='600036', start=0, count=30)      # 分笔成交
+    df = q.quotes(symbols=['600036', '000001'])                  # 实时快照 (批量)
+    df = q.finance(symbol='600036')                              # 财务数据
+    info = q.f10(symbol='600036')                                # F10 公司资料
 ```
 
 手动指定服务器：
@@ -119,6 +154,17 @@ q.disconnect()
 ```
 
 所有方法均支持 `backend='polars'` 参数切换至 Polars DataFrame。
+
+**`stocks()` / `stock_all()` 返回字段：**
+
+| 字段            | 类型   | 说明                                |
+| --------------- | ------ | ----------------------------------- |
+| `code`          | str    | 证券代码 (如 `600036`)              |
+| `name`          | str    | 证券名称 (GBK→UTF-8)               |
+| `volunit`       | int    | 最小交易单位 (通常 100)             |
+| `decimal_point` | int    | 价格小数位数 (通常 2)               |
+| `pre_close`     | float  | 昨收价                              |
+| `market`        | int    | 市场代码 (仅 `stock_all()` 返回)    |
 
 **`frequency` 参数：**
 
@@ -171,6 +217,8 @@ records = read_minute_bars('path/to/sh600036.lc1')
 client = TdxClient()
 client.connect('110.41.147.114', 7709)
 bars = client.get_security_bars(category=9, market=1, code='600036', start=0, count=10)
+count = client.get_security_count(market=1)
+stocks = client.get_security_list(market=1, start=0)
 client.disconnect()
 ```
 
@@ -190,9 +238,10 @@ mitdx/
 │   ├── affair.py            # 财务数据
 │   ├── calendar.py          # 交易日历
 │   ├── cli.py               # 命令行工具
-│   ├── consts.py            # 服务器地址
+│   ├── consts.py            # 服务器地址 / 常量
 │   ├── columns.py           # 财报列名 (580+)
-│   └── utils.py             # DataFrame 转换
+│   ├── utils.py             # DataFrame 转换
+│   └── _core.pyi            # Rust 扩展类型标注
 ├── Cargo.toml
 └── pyproject.toml
 ```
@@ -210,13 +259,17 @@ pytest tests/ -v
 
 ## 从 mootdx 迁移
 
-| mootdx                                     | mitdx                             | 变化               |
-| ------------------------------------------ | --------------------------------- | ------------------ |
-| `from mootdx.reader import Reader`         | `from mitdx.reader import Reader` | 包名               |
-| `Reader.factory(market='std', tdxdir=...)` | 相同                              | —                  |
-| `reader.daily(symbol='600036')`            | 相同                              | —                  |
-| `Quotes.factory(market='std')`             | 相同                              | —                  |
-| `q.bars(symbol=..., offset=10)`            | `q.bars(symbol=..., count=10)`    | `offset` → `count` |
+| mootdx                                       | mitdx                                     | 变化                            |
+| -------------------------------------------- | ----------------------------------------- | ------------------------------- |
+| `from mootdx.reader import Reader`           | `from mitdx.reader import Reader`         | 包名                            |
+| `Reader.factory(market='std', tdxdir=...)`   | 相同                                      | —                               |
+| `reader.daily(symbol='600036')`              | 相同                                      | —                               |
+| `Quotes.factory(market='std')`               | 相同                                      | —                               |
+| `q.bars(symbol=..., offset=10)`              | `q.bars(symbol=..., count=10)`            | `offset` → `count`              |
+| `q.stock_count(market=MARKET_SH)`            | 相同                                      | —                               |
+| `q.stocks(market=MARKET_SH)`                 | 相同                                      | —                               |
+| `q.stock_all()`                              | 相同                                      | —                               |
+| `from mootdx.consts import MARKET_SH`        | `from mitdx.consts import MARKET_SH`      | 包名                            |
 
 ## License
 

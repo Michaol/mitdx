@@ -2,9 +2,14 @@ import logging
 from typing import List, Optional, Tuple, Union
 from mitdx._core import TdxClient, ping_servers
 from mitdx.utils import to_df
-from mitdx.consts import HQ_HOSTS
+from mitdx.consts import HQ_HOSTS, MARKET_SH, MARKET_SZ, SECURITY_LIST_BATCH_SIZE
 
 logger = logging.getLogger(__name__)
+
+# Valid TDX market codes for security listing (0=Shenzhen, 1=Shanghai).
+# Note: market=2 (北交所) exists in mootdx but TDX protocol does not support
+# GetSecurityList/GetSecurityCount for it.
+_VALID_SECURITY_MARKETS = (MARKET_SZ, MARKET_SH)
 
 
 def _market_code(symbol: str) -> int:
@@ -14,8 +19,17 @@ def _market_code(symbol: str) -> int:
     """
     s = str(symbol).lower().removeprefix("sh").removeprefix("sz")
     if s and s[0] in ("5", "6", "9", "7"):
-        return 1
-    return 0
+        return MARKET_SH
+    return MARKET_SZ
+
+
+def _validate_market(market: int) -> None:
+    """Validate that market code is supported for security listing."""
+    if market not in _VALID_SECURITY_MARKETS:
+        raise ValueError(
+            f"market must be {MARKET_SZ} (Shenzhen) or {MARKET_SH} (Shanghai), "
+            f"got {market!r}"
+        )
 
 
 class Quotes:
@@ -65,7 +79,88 @@ class Quotes:
             raise ConnectionError("Failed to connect to any TDX HQ server. All pings failed.")
 
     # ---------------------------------------------------------------
-    #  bars  —  K线数据 (已有)
+    #  _fetch_security_batch  —  内部：单市场分页拉取证券列表
+    # ---------------------------------------------------------------
+    def _fetch_security_batch(self, market: int) -> List[dict]:
+        """Fetch the full security list for a single market via pagination.
+
+        Shared by stocks() and stock_all() to avoid DRY duplication.
+        Returns a list of dicts with keys: code, volunit, name, decimal_point, pre_close.
+        """
+        _validate_market(market)
+        count = self.client.get_security_count(market=market)
+        all_stocks: List[dict] = []
+        total_batches = (count + SECURITY_LIST_BATCH_SIZE - 1) // SECURITY_LIST_BATCH_SIZE
+
+        for batch_idx, start in enumerate(range(0, count, SECURITY_LIST_BATCH_SIZE), start=1):
+            batch = self.client.get_security_list(market=market, start=start)
+            all_stocks.extend(batch)
+            logger.info(
+                "Fetching market %d securities: batch %d/%d (fetched %d/%d)",
+                market, batch_idx, total_batches, len(all_stocks), count,
+            )
+
+        return all_stocks
+
+    # ---------------------------------------------------------------
+    #  stock_count  —  市场证券数量
+    # ---------------------------------------------------------------
+    def stock_count(self, market: int = MARKET_SH) -> int:
+        """
+        Get the total number of securities for a given market.
+        market: 0 = Shenzhen (深圳), 1 = Shanghai (上海)
+        """
+        self._ensure_connected()
+        _validate_market(market)
+        try:
+            return self.client.get_security_count(market=market)
+        except Exception:
+            logger.exception("Failed to fetch security count for market=%d", market)
+            self.disconnect()
+            raise
+
+    # ---------------------------------------------------------------
+    #  stocks  —  市场证券列表
+    # ---------------------------------------------------------------
+    def stocks(self, market: int = MARKET_SH, backend: str = 'pandas', **kwargs):
+        """
+        Get the full list of securities for a given market.
+        Returns DataFrame with columns: code, name, volunit, decimal_point, pre_close.
+        market: 0 = Shenzhen (深圳), 1 = Shanghai (上海)
+        """
+        self._ensure_connected()
+        try:
+            all_stocks = self._fetch_security_batch(market)
+            return to_df(all_stocks, backend=backend)
+        except Exception:
+            logger.exception("Failed to fetch security list for market=%d", market)
+            self.disconnect()
+            raise
+
+    # ---------------------------------------------------------------
+    #  stock_all  —  全市场证券列表 (沪深)
+    # ---------------------------------------------------------------
+    def stock_all(self, backend: str = 'pandas', **kwargs):
+        """
+        Get the full list of securities from both Shanghai and Shenzhen markets.
+        Returns DataFrame with columns: market, code, name, volunit, decimal_point, pre_close.
+        """
+        self._ensure_connected()
+        try:
+            all_stocks: List[dict] = []
+            for market in _VALID_SECURITY_MARKETS:
+                batch = self._fetch_security_batch(market)
+                for item in batch:
+                    item['market'] = market
+                all_stocks.extend(batch)
+            return to_df(all_stocks, backend=backend)
+        except Exception:
+            logger.exception("Failed to fetch all securities")
+            self.disconnect()
+            raise
+
+    # ---------------------------------------------------------------
+    #  bars  —  K线数据
     # ---------------------------------------------------------------
     def bars(self, symbol: str = '600036', frequency: int = 9, start: int = 0, count: int = 10, backend: str = 'pandas', **kwargs):
         """
@@ -77,8 +172,8 @@ class Quotes:
         try:
             res = self.client.get_security_bars(category=frequency, market=market, code=symbol, start=start, count=count)
             return to_df(res, backend=backend)
-        except Exception as e:
-            logger.error("Failed to fetch bars: %s", e)
+        except Exception:
+            logger.exception("Failed to fetch bars for symbol=%s", symbol)
             self.disconnect()  # Force reconnect next time
             raise
 
@@ -113,8 +208,8 @@ class Quotes:
         try:
             res = self.client.get_xdxr_info(market=market, code=symbol)
             return to_df(res, backend=backend)
-        except Exception as e:
-            logger.error("Failed to fetch xdxr: %s", e)
+        except Exception:
+            logger.exception("Failed to fetch xdxr for symbol=%s", symbol)
             self.disconnect()
             raise
 
@@ -130,8 +225,8 @@ class Quotes:
         try:
             res = self.client.get_transaction_data(market=market, code=symbol, start=start, count=count)
             return to_df(res, backend=backend)
-        except Exception as e:
-            logger.error("Failed to fetch transactions: %s", e)
+        except Exception:
+            logger.exception("Failed to fetch transactions for symbol=%s", symbol)
             self.disconnect()
             raise
 
@@ -149,6 +244,7 @@ class Quotes:
         self._ensure_connected()
 
         # Normalize to list of (market, code) tuples
+        stock_list: List[Tuple[int, str]]
         if isinstance(symbols, str):
             stock_list = [(_market_code(symbols), symbols)]
         elif isinstance(symbols, list) and len(symbols) > 0:
@@ -162,8 +258,8 @@ class Quotes:
         try:
             res = self.client.get_security_quotes(stock_list=stock_list)
             return to_df(res, backend=backend)
-        except Exception as e:
-            logger.error("Failed to fetch quotes: %s", e)
+        except Exception:
+            logger.exception("Failed to fetch quotes for symbols=%s", symbols)
             self.disconnect()
             raise
 
@@ -180,8 +276,8 @@ class Quotes:
         try:
             res = self.client.get_finance_info(market=market, code=symbol)
             return to_df([res], backend=backend)
-        except Exception as e:
-            logger.error("Failed to fetch finance: %s", e)
+        except Exception:
+            logger.exception("Failed to fetch finance for symbol=%s", symbol)
             self.disconnect()
             raise
 
@@ -211,8 +307,8 @@ class Quotes:
                     parts.append(text)
             result["content"] = "\n".join(parts)
             return result
-        except Exception as e:
-            logger.error("Failed to fetch F10: %s", e)
+        except Exception:
+            logger.exception("Failed to fetch F10 for symbol=%s", symbol)
             self.disconnect()
             raise
 
@@ -222,4 +318,3 @@ class Quotes:
 
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.disconnect()
-

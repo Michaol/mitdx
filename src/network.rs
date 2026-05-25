@@ -50,6 +50,32 @@ const CMD_ID_F10_CONTENT: u16 = 0x02d0;
 // Finance info (财务信息) command
 const CMD_ID_FINANCE: u16 = 0x0010;
 
+// Security count (获取证券数量) command
+const CMD_ID_SECURITY_COUNT: u16 = 0x044e;
+
+// Security list (获取证券列表) command
+const CMD_ID_SECURITY_LIST: u16 = 0x0450;
+
+/// Parse a little-endian u16 from a byte slice at the given offset.
+fn parse_u16_le(data: &[u8], offset: usize, field: &str) -> PyResult<u16> {
+    data[offset..offset + 2]
+        .try_into()
+        .map(u16::from_le_bytes)
+        .map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Malformed {} data", field))
+        })
+}
+
+/// Parse a little-endian u32 from a byte slice at the given offset.
+fn parse_u32_le(data: &[u8], offset: usize, field: &str) -> PyResult<u32> {
+    data[offset..offset + 4]
+        .try_into()
+        .map(u32::from_le_bytes)
+        .map_err(|_| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Malformed {} data", field))
+        })
+}
+
 /// Parse address string safely, returning a PyResult error on invalid input.
 fn parse_addr(addr: &str) -> PyResult<std::net::SocketAddr> {
     addr.parse().map_err(|e| {
@@ -929,6 +955,119 @@ impl TdxClient {
         }
 
         Ok(dict.into_any().unbind())
+    }
+
+    /// Get the total number of securities for a given market.
+    /// market: 0 = Shenzhen (深圳), 1 = Shanghai (上海)
+    /// Returns the total count of securities.
+    pub fn get_security_count(&mut self, market: u8) -> PyResult<u16> {
+        let stream = self.require_stream()?;
+
+        // Build request: 0c 0c 18 6c 00 01 08 00 08 00 4e 04 <market_u16> 75 c7 33 01
+        let mut req = Vec::with_capacity(18);
+        req.extend_from_slice(&[0x0c, 0x0c, 0x18, 0x6c, 0x00, 0x01, 0x08, 0x00, 0x08, 0x00]);
+        req.extend_from_slice(&CMD_ID_SECURITY_COUNT.to_le_bytes()); // 4e 04
+        req.extend_from_slice(&(market as u16).to_le_bytes());
+        req.extend_from_slice(&[0x75, 0xc7, 0x33, 0x01]);
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 2 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Malformed security count response: expected at least 2 bytes",
+            ));
+        }
+
+        let count = parse_u16_le(&data, 0, "count")?;
+        Ok(count)
+    }
+
+    /// Get a batch of securities for a given market, starting from `start`.
+    /// market: 0 = Shenzhen (深圳), 1 = Shanghai (上海)
+    /// start: offset (typically 0, 1000, 2000, ...)
+    /// Returns a list of dicts with keys: code, name, volunit, decimal_point, pre_close.
+    pub fn get_security_list(
+        &mut self,
+        py: Python<'_>,
+        market: u8,
+        start: u16,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.require_stream()?;
+
+        // Build request: 0c 01 18 64 01 01 06 00 06 00 50 04 <market_u16> <start_u16>
+        let mut req = Vec::with_capacity(16);
+        req.extend_from_slice(&[0x0c, 0x01, 0x18, 0x64, 0x01, 0x01, 0x06, 0x00, 0x06, 0x00]);
+        req.extend_from_slice(&CMD_ID_SECURITY_LIST.to_le_bytes()); // 50 04
+        req.extend_from_slice(&(market as u16).to_le_bytes());
+        req.extend_from_slice(&start.to_le_bytes());
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 2 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Malformed security list response: expected at least 2 bytes",
+            ));
+        }
+
+        let num = parse_u16_le(&data, 0, "list header")? as usize;
+
+        let mut pos = 2;
+        let mut results = Vec::with_capacity(num);
+
+        for _ in 0..num {
+            // Each record is 29 bytes:
+            //   6s  code (ASCII)          offset 0..6
+            //   H   volunit               offset 6..8
+            //   8s  name (GBK encoded)    offset 8..16
+            //   4s  reserved1 (ignored)   offset 16..20
+            //   B   decimal_point         offset 20
+            //   I   pre_close_raw         offset 21..25
+            //   4s  reserved2 (ignored)   offset 25..29
+            if pos + 29 > data.len() {
+                break;
+            }
+
+            let record = &data[pos..pos + 29];
+            pos += 29;
+
+            // code: 6 bytes ASCII, strip null bytes
+            let code_bytes = &record[0..6];
+            let code = String::from_utf8_lossy(code_bytes)
+                .trim_end_matches('\0')
+                .to_string();
+
+            // volunit: u16 LE at offset 6
+            let volunit = parse_u16_le(record, 6, "volunit")?;
+
+            // name: 8 bytes GBK at offset 8, strip null bytes
+            let name_bytes = &record[8..16];
+            let name = decode_gbk(name_bytes)
+                .trim_end_matches('\0')
+                .to_string();
+
+            // reserved1: 4 bytes at offset 16 — TDX protocol reserved field, pytdx ignores it
+            // decimal_point: u8 at offset 20
+            let decimal_point = record[20];
+
+            // pre_close_raw: u32 LE at offset 21
+            let pre_close_raw = parse_u32_le(record, 21, "pre_close")?;
+            let pre_close = get_volume(pre_close_raw);
+
+            // reserved2: 4 bytes at offset 25 — TDX protocol reserved field, pytdx ignores it
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("code", code)?;
+            dict.set_item("volunit", volunit)?;
+            dict.set_item("name", name)?;
+            dict.set_item("decimal_point", decimal_point)?;
+            dict.set_item("pre_close", pre_close)?;
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
     }
 }
 
