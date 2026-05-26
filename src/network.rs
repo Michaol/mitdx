@@ -56,6 +56,21 @@ const CMD_ID_SECURITY_COUNT: u16 = 0x044e;
 // Security list (获取证券列表) command
 const CMD_ID_SECURITY_LIST: u16 = 0x0450;
 
+// Minute time data (当日分时数据) command
+const CMD_ID_MINUTE_TIME: u16 = 0x051d;
+
+// History minute time data (历史分时数据) command
+const CMD_ID_HISTORY_MINUTE_TIME: u16 = 0x0fb4;
+
+// History transaction data (历史分笔成交) command
+const CMD_ID_HISTORY_TRANSACTION: u16 = 0x0fb5;
+
+// Block info meta (板块元数据) command
+const CMD_ID_BLOCK_META: u16 = 0x02c5;
+
+// Block info data (板块详情) command
+const CMD_ID_BLOCK_DATA: u16 = 0x06b9;
+
 /// Parse a little-endian u16 from a byte slice at the given offset.
 fn parse_u16_le(data: &[u8], offset: usize, field: &str) -> PyResult<u16> {
     data[offset..offset + 2]
@@ -1068,6 +1083,395 @@ impl TdxClient {
         }
 
         Ok(results)
+    }
+
+    // ===============================================================
+    //  get_index_bars  —  指数K线 (含涨跌家数)
+    // ===============================================================
+    /// Get index K-line bars. Same protocol as security bars (0x052D) but response
+    /// includes up_count/down_count fields (number of advancing/declining stocks).
+    pub fn get_index_bars(
+        &mut self,
+        py: Python<'_>,
+        category: u16,
+        market: u8,
+        code: &str,
+        start: u16,
+        count: u16,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
+
+        // Same packet structure as get_security_bars
+        let mut req = Vec::with_capacity(38);
+        req.extend_from_slice(&0x10c_u16.to_le_bytes());
+        req.extend_from_slice(&0x01016408_u32.to_le_bytes());
+        req.extend_from_slice(&0x1c_u16.to_le_bytes());
+        req.extend_from_slice(&0x1c_u16.to_le_bytes());
+        req.extend_from_slice(&CMD_ID_BARS.to_le_bytes());
+        req.extend_from_slice(&(market as u16).to_le_bytes());
+        req.extend_from_slice(&code_buf);
+        req.extend_from_slice(&category.to_le_bytes());
+        req.extend_from_slice(&1u16.to_le_bytes());
+        req.extend_from_slice(&start.to_le_bytes());
+        req.extend_from_slice(&count.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes());
+        req.extend_from_slice(&0u16.to_le_bytes());
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 2 {
+            return Ok(vec![]);
+        }
+
+        let ret_count = parse_u16_le(&data, 0, "index bar count")?;
+        let mut pos = 2;
+        let mut pre_diff_base: i64 = 0;
+
+        let mut results = Vec::with_capacity(ret_count as usize);
+
+        for _ in 0..ret_count {
+            let (year, month, day, hour, minute, new_pos) =
+                match get_datetime(category, &data, pos) {
+                    Some(v) => v,
+                    None => break,
+                };
+            pos = new_pos;
+
+            let (mut price_open_diff, p1) = get_price(&data, pos);
+            pos = p1;
+            let (price_close_diff, p2) = get_price(&data, pos);
+            pos = p2;
+            let (price_high_diff, p3) = get_price(&data, pos);
+            pos = p3;
+            let (price_low_diff, p4) = get_price(&data, pos);
+            pos = p4;
+
+            // Need 12 more bytes: vol(4) + amount(4) + up_count(2) + down_count(2)
+            if pos + 12 > data.len() {
+                break;
+            }
+
+            let vol_raw = parse_u32_le(&data, pos, "volume")?;
+            let vol = get_volume(vol_raw);
+            pos += 4;
+
+            let db_vol_raw = parse_u32_le(&data, pos, "amount")?;
+            let amount = get_volume(db_vol_raw);
+            pos += 4;
+
+            // Index-specific: up_count and down_count
+            let up_count = parse_u16_le(&data, pos, "up_count")?;
+            pos += 2;
+            let down_count = parse_u16_le(&data, pos, "down_count")?;
+            pos += 2;
+
+            let open = ((price_open_diff + pre_diff_base) as f64) / 1000.0;
+            price_open_diff += pre_diff_base;
+            let close = ((price_open_diff + price_close_diff) as f64) / 1000.0;
+            let high = ((price_open_diff + price_high_diff) as f64) / 1000.0;
+            let low = ((price_open_diff + price_low_diff) as f64) / 1000.0;
+
+            pre_diff_base = price_open_diff + price_close_diff;
+
+            let dt_str = format!("{}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, minute);
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("datetime", dt_str)?;
+            dict.set_item("open", open)?;
+            dict.set_item("high", high)?;
+            dict.set_item("low", low)?;
+            dict.set_item("close", close)?;
+            dict.set_item("vol", vol)?;
+            dict.set_item("amount", amount)?;
+            dict.set_item("up_count", up_count)?;
+            dict.set_item("down_count", down_count)?;
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
+    }
+
+    // ===============================================================
+    //  get_minute_time_data  —  当日分时数据
+    // ===============================================================
+    /// Get intraday minute-by-minute price/volume data for today.
+    /// Returns list of dicts with keys: price, vol.
+    pub fn get_minute_time_data(
+        &mut self,
+        py: Python<'_>,
+        market: u8,
+        code: &str,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
+
+        // Packet: 0c 1b 08 00 01 01 0e 00 0e 00 1d 05 <H6sI>
+        let mut req = Vec::with_capacity(24);
+        req.extend_from_slice(&[0x0c, 0x1b, 0x08, 0x00, 0x01, 0x01, 0x0e, 0x00, 0x0e, 0x00]);
+        req.extend_from_slice(&CMD_ID_MINUTE_TIME.to_le_bytes());
+        req.extend_from_slice(&(market as u16).to_le_bytes());
+        req.extend_from_slice(&code_buf);
+        req.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 2 {
+            return Ok(vec![]);
+        }
+
+        let num = parse_u16_le(&data, 0, "minute count")?;
+        let mut pos = 4; // skip 2 bytes count + 2 bytes reserved
+        let mut last_price: i64 = 0;
+
+        let mut results = Vec::with_capacity(num as usize);
+
+        for _ in 0..num {
+            if pos >= data.len() {
+                break;
+            }
+
+            let (price_raw, p1) = get_price(&data, pos);
+            pos = p1;
+            let (_reserved, p2) = get_price(&data, pos);
+            pos = p2;
+            let (vol, p3) = get_price(&data, pos);
+            pos = p3;
+
+            last_price += price_raw;
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("price", (last_price as f64) / 100.0)?;
+            dict.set_item("vol", vol)?;
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
+    }
+
+    // ===============================================================
+    //  get_history_minute_time_data  —  历史分时数据
+    // ===============================================================
+    /// Get minute-by-minute price/volume data for a historical date.
+    /// date: YYYYMMDD format integer, e.g. 20260101
+    pub fn get_history_minute_time_data(
+        &mut self,
+        py: Python<'_>,
+        market: u8,
+        code: &str,
+        date: u32,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
+
+        // Packet: 0c 01 30 00 01 01 0d 00 0d 00 b4 0f <I B 6s>
+        let mut req = Vec::with_capacity(23);
+        req.extend_from_slice(&[0x0c, 0x01, 0x30, 0x00, 0x01, 0x01, 0x0d, 0x00, 0x0d, 0x00]);
+        req.extend_from_slice(&CMD_ID_HISTORY_MINUTE_TIME.to_le_bytes());
+        req.extend_from_slice(&date.to_le_bytes());
+        req.push(market);
+        req.extend_from_slice(&code_buf);
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 2 {
+            return Ok(vec![]);
+        }
+
+        let num = parse_u16_le(&data, 0, "history minute count")?;
+        let mut pos = 6; // skip 2 bytes count + 4 bytes unknown (pytdx: pos += 6)
+        let mut last_price: i64 = 0;
+
+        let mut results = Vec::with_capacity(num as usize);
+
+        for _ in 0..num {
+            if pos >= data.len() {
+                break;
+            }
+
+            let (price_raw, p1) = get_price(&data, pos);
+            pos = p1;
+            let (_reserved, p2) = get_price(&data, pos);
+            pos = p2;
+            let (vol, p3) = get_price(&data, pos);
+            pos = p3;
+
+            last_price += price_raw;
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("price", (last_price as f64) / 100.0)?;
+            dict.set_item("vol", vol)?;
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
+    }
+
+    // ===============================================================
+    //  get_history_transaction_data  —  历史分笔成交
+    // ===============================================================
+    /// Get tick-level transaction data for a historical date.
+    /// date: YYYYMMDD format integer, e.g. 20260101
+    pub fn get_history_transaction_data(
+        &mut self,
+        py: Python<'_>,
+        market: u8,
+        code: &str,
+        start: u16,
+        count: u16,
+        date: u32,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let stream = self.require_stream()?;
+        let code_buf = Self::code_bytes(code);
+
+        // Packet: 0c 01 30 01 00 01 12 00 12 00 b5 0f <I H 6s H H>
+        let mut req = Vec::with_capacity(28);
+        req.extend_from_slice(&[0x0c, 0x01, 0x30, 0x01, 0x00, 0x01, 0x12, 0x00, 0x12, 0x00]);
+        req.extend_from_slice(&CMD_ID_HISTORY_TRANSACTION.to_le_bytes());
+        req.extend_from_slice(&date.to_le_bytes());
+        req.extend_from_slice(&(market as u16).to_le_bytes());
+        req.extend_from_slice(&code_buf);
+        req.extend_from_slice(&start.to_le_bytes());
+        req.extend_from_slice(&count.to_le_bytes());
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        if data.len() < 2 {
+            return Ok(vec![]);
+        }
+
+        let num = parse_u16_le(&data, 0, "history tick count")?;
+        let mut pos = 6; // skip 2 bytes count + 4 bytes unknown
+        let mut last_price: i64 = 0;
+
+        let mut results = Vec::with_capacity(num as usize);
+
+        for _ in 0..num {
+            if pos >= data.len() {
+                break;
+            }
+
+            let (hour, minute, new_pos) = match get_time(&data, pos) {
+                Some(v) => v,
+                None => break,
+            };
+            pos = new_pos;
+
+            let (price_raw, p1) = get_price(&data, pos);
+            pos = p1;
+            let (vol, p2) = get_price(&data, pos);
+            pos = p2;
+            let (buyorsell, p3) = get_price(&data, pos);
+            pos = p3;
+            let (_reserved, p4) = get_price(&data, pos);
+            pos = p4;
+
+            last_price += price_raw;
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("time", format!("{:02}:{:02}", hour, minute))?;
+            dict.set_item("price", (last_price as f64) / 100.0)?;
+            dict.set_item("vol", vol)?;
+            dict.set_item("buyorsell", buyorsell)?;
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
+    }
+
+    // ===============================================================
+    //  get_block_info_meta  —  板块元数据
+    // ===============================================================
+    /// Get block file metadata (size, hash).
+    /// block_file: e.g. "block_zs.dat", "block_gn.dat", "block_fg.dat"
+    pub fn get_block_info_meta(
+        &mut self,
+        py: Python<'_>,
+        block_file: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let stream = self.require_stream()?;
+
+        // Packet: 0C 39 18 69 00 01 2A 00 2A 00 C5 02 <40s>
+        let mut req = Vec::with_capacity(54);
+        req.extend_from_slice(&[0x0C, 0x39, 0x18, 0x69, 0x00, 0x01, 0x2A, 0x00, 0x2A, 0x00]);
+        req.extend_from_slice(&CMD_ID_BLOCK_META.to_le_bytes());
+        let file_bytes = block_file.as_bytes();
+        let mut buf = [0u8; 40]; // 0x2a - 2 = 40
+        let len = std::cmp::min(40, file_bytes.len());
+        buf[..len].copy_from_slice(&file_bytes[..len]);
+        req.extend_from_slice(&buf);
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        // Response: I(4) size + 1s + 32s hash + 1s = 38 bytes
+        if data.len() < 38 {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Malformed block meta response",
+            ));
+        }
+
+        let size = parse_u32_le(&data, 0, "block size")?;
+        let hash_bytes = &data[5..37];
+        let hash_value = String::from_utf8_lossy(hash_bytes)
+            .trim_end_matches('\0')
+            .to_string();
+
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("size", size)?;
+        dict.set_item("hash_value", hash_value)?;
+
+        Ok(dict.into_any().unbind())
+    }
+
+    // ===============================================================
+    //  get_block_info  —  板块详情数据
+    // ===============================================================
+    /// Get block file data chunk.
+    /// block_file: e.g. "block_zs.dat"
+    /// start: byte offset
+    /// size: file total size
+    /// Returns raw bytes (skip first 4 bytes of response body).
+    pub fn get_block_info(
+        &mut self,
+        block_file: &str,
+        start: u32,
+        size: u32,
+    ) -> PyResult<std::borrow::Cow<'_, [u8]>> {
+        let stream = self.require_stream()?;
+
+        // Packet: 0c 37 18 6a 00 01 6e 00 6e 00 b9 06 <I I 96s>
+        let mut req = Vec::with_capacity(112);
+        req.extend_from_slice(&[0x0c, 0x37, 0x18, 0x6a, 0x00, 0x01, 0x6e, 0x00, 0x6e, 0x00]);
+        req.extend_from_slice(&CMD_ID_BLOCK_DATA.to_le_bytes());
+        req.extend_from_slice(&start.to_le_bytes());
+        req.extend_from_slice(&size.to_le_bytes());
+        // pytdx: struct.pack("<II{0x6e-10}s", start, size, block_file)
+        // 0x6e = 110 bytes total payload. cmd(2) + start(4) + size(4) + file_buf(100) = 110
+        let file_bytes = block_file.as_bytes();
+        let mut file_buf = [0u8; 100];
+        let len = std::cmp::min(100, file_bytes.len());
+        file_buf[..len].copy_from_slice(&file_bytes[..len]);
+        req.extend_from_slice(&file_buf);
+
+        stream.write_all(&req)?;
+        let data = Self::read_response(stream)?;
+
+        // Response: skip first 4 bytes, return the rest
+        if data.len() <= 4 {
+            return Ok(std::borrow::Cow::Borrowed(&[]));
+        }
+
+        Ok(std::borrow::Cow::Owned(data[4..].to_vec()))
     }
 }
 

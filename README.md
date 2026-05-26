@@ -13,18 +13,44 @@
 | --------------------------- | --------- | ------------------- | ------------------- |
 | `get_security_count`        | `0x044E`  | 市场证券数量        | `stock_count()`     |
 | `get_security_list`         | `0x0450`  | 证券列表 (代码/名称)| `stocks()` `stock_all()` |
-| `get_security_bars`         | `0x052D`  | K 线数据            | `bars()` `minute()` `index()` |
+| `get_security_bars`         | `0x052D`  | K 线数据            | `bars()` `minute()` |
+| `get_index_bars`            | `0x052D`  | 指数K线 (含涨跌家数)| `index_bars()`      |
 | `get_security_quotes`       | `0x5053E` | 实时五档盘口        | `quotes()`          |
-| `get_transaction_data`      | `0x0FC5`  | 分笔成交            | `transactions()`    |
+| `get_transaction_data`      | `0x0FC5`  | 当日分笔成交        | `transactions()`    |
+| `get_minute_time_data`      | `0x051D`  | 当日分时数据        | `minute_data()`     |
+| `get_history_minute_time`   | `0x0FB4`  | 历史分时数据        | `history_minute_data()` |
+| `get_history_transaction`   | `0x0FB5`  | 历史分笔成交        | `history_transactions()` |
 | `get_xdxr_info`             | `0x000F`  | 除权除息            | `xdxr()`            |
 | `get_finance_info`          | `0x0010`  | 财务摘要            | `finance()`         |
 | `get_company_info_category` | `0x02CF`  | F10 公司资料目录    | `f10()`             |
 | `get_company_info_content`  | `0x02D0`  | F10 公司资料内容    | `f10()`             |
+| `get_block_info_meta`       | `0x02C5`  | 板块元数据          | `block_meta()`      |
+| `get_block_info`            | `0x06B9`  | 板块成分股          | `block_info()`      |
 | `get_report_file`           | `0x06B9`  | 报表文件下载        | —                   |
 
 ## Changelog
 
-### v1.1.8 (2026-05-25)
+### v1.1.9 (2026-05-26)
+
+新增 7 个通达信标准 HQ 协议接口，补齐分时数据、历史数据、指数K线和板块数据能力。
+
+| 新增协议                    | 指令     | 功能                                |
+| --------------------------- | -------- | ----------------------------------- |
+| `get_index_bars`            | `0x052D` | 指数K线 (含涨跌家数 up/down_count)  |
+| `get_minute_time_data`      | `0x051D` | 当日分时数据                        |
+| `get_history_minute_time`   | `0x0FB4` | 历史分时数据 (指定日期)             |
+| `get_history_transaction`   | `0x0FB5` | 历史分笔成交 (指定日期)             |
+| `get_block_info_meta`       | `0x02C5` | 板块元数据 (文件尺寸/哈希)          |
+| `get_block_info`            | `0x06B9` | 板块成分股数据                      |
+
+新增 Python API：`index_bars()` · `minute_data()` · `history_minute_data()` · `history_transactions()` · `block_meta()` · `block_info()` · `k()`
+
+其他：`index()` 现为 `index_bars()` 别名，自动识别指数市场码 (000xxx/88xxxx/99xxxx→SH，399xxx→SZ)；新增 `_parse_block_data()` Python 板块文件解析器；`k()` 支持日期范围 K 线查询。
+
+<details>
+<summary>历史版本</summary>
+
+**v1.1.8 (2026-05-25)**
 
 新增 TDX 协议 `GetSecurityCount` / `GetSecurityList` 命令，支持从通达信服务器获取全量股票代码与名称映射。
 
@@ -36,9 +62,6 @@
 新增 Python API：`stock_count()` · `stocks()` · `stock_all()`
 
 其他：Rust 层新增 `parse_u16_le()` / `parse_u32_le()` 辅助函数消除重复；Python 层新增 `MARKET_SH` / `MARKET_SZ` / `SECURITY_LIST_BATCH_SIZE` 常量；`stock_all()` 与 `stocks()` 分页逻辑去重；全量 `logger.exception()` 替换 `logger.error()` 保留堆栈跟踪；市场参数校验与 mootdx API 兼容。
-
-<details>
-<summary>历史版本</summary>
 
 **v1.1.7 (2026-04-30)**
 
@@ -136,12 +159,24 @@ with Quotes.factory(market='std') as q:
     # 行情数据
     df = q.bars(symbol='600036', frequency=9, count=20)          # K线
     df = q.minute(symbol='600036', frequency=0, count=20)        # 分钟线 (bars 别名)
-    df = q.index(symbol='000001', frequency=9, count=20)         # 指数 (bars 别名)
+    df = q.index_bars(symbol='000001', frequency=9, count=20)    # 指数K线 (含涨跌家数)
     df = q.xdxr(symbol='600036')                                 # 除权除息
-    df = q.transactions(symbol='600036', start=0, count=30)      # 分笔成交
+    df = q.transactions(symbol='600036', start=0, count=30)      # 当日分笔成交
     df = q.quotes(symbols=['600036', '000001'])                  # 实时快照 (批量)
     df = q.finance(symbol='600036')                              # 财务数据
     info = q.f10(symbol='600036')                                # F10 公司资料
+
+    # 分时与历史数据
+    df = q.minute_data(symbol='600036')                          # 当日分时数据
+    df = q.history_minute_data(symbol='600036', date=20250520)   # 历史分时数据
+    df = q.history_transactions(symbol='600036', date=20250520)  # 历史分笔成交
+
+    # 板块数据
+    meta = q.block_meta('block_zs.dat')                          # 板块元数据
+    df = q.block_info('block_zs.dat')                            # 板块成分股
+
+    # 日期范围K线
+    df = q.k(symbol='600036', begin='20250501', end='20250520')  # 按日期范围查K线
 ```
 
 手动指定服务器：
@@ -219,6 +254,12 @@ client.connect('110.41.147.114', 7709)
 bars = client.get_security_bars(category=9, market=1, code='600036', start=0, count=10)
 count = client.get_security_count(market=1)
 stocks = client.get_security_list(market=1, start=0)
+index = client.get_index_bars(category=9, market=1, code='000001', start=0, count=10)
+minute = client.get_minute_time_data(market=1, code='600036')
+hist_min = client.get_history_minute_time_data(market=1, code='600036', date=20250520)
+hist_tx = client.get_history_transaction_data(market=1, code='600036', start=0, count=10, date=20250520)
+meta = client.get_block_info_meta(block_file='block_zs.dat')
+chunk = client.get_block_info(block_file='block_zs.dat', start=0, size=meta['size'])
 client.disconnect()
 ```
 
@@ -269,6 +310,11 @@ pytest tests/ -v
 | `q.stock_count(market=MARKET_SH)`            | 相同                                      | —                               |
 | `q.stocks(market=MARKET_SH)`                 | 相同                                      | —                               |
 | `q.stock_all()`                              | 相同                                      | —                               |
+| `q.index_bars(symbol='000001')`              | 相同                                      | —                               |
+| `q.minute_data(symbol='600036')`             | `q.minute_data(symbol='600036')`          | —                               |
+| `q.minutes(symbol, date='20250520')`         | `q.history_minute_data(symbol, date=20250520)` | 方法名                    |
+| `q.transactions(symbol, date='20250520')`    | `q.history_transactions(symbol, date=20250520)` | 方法名                 |
+| `q.block('block_zs.dat')`                    | `q.block_info('block_zs.dat')`            | 方法名                          |
 | `from mootdx.consts import MARKET_SH`        | `from mitdx.consts import MARKET_SH`      | 包名                            |
 
 ## License

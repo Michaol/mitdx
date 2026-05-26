@@ -23,6 +23,17 @@ def _market_code(symbol: str) -> int:
     return MARKET_SZ
 
 
+def _index_market_code(symbol: str) -> int:
+    """Infer TDX market code for index/指数 symbols.
+    Shanghai indices (market=1): 000xxx (上证指数), 88xxxx, 99xxxx
+    Shenzhen indices (market=0): 399xxx (深证指数)
+    """
+    s = str(symbol).strip()
+    if s[:3] in ("000", "888", "999") or s[:2] in ("88", "99"):
+        return MARKET_SH
+    return MARKET_SZ
+
+
 def _validate_market(market: int) -> None:
     """Validate that market code is supported for security listing."""
     if market not in _VALID_SECURITY_MARKETS:
@@ -30,6 +41,63 @@ def _validate_market(market: int) -> None:
             f"market must be {MARKET_SZ} (Shenzhen) or {MARKET_SH} (Shanghai), "
             f"got {market!r}"
         )
+
+
+def _parse_block_data(data: bytes) -> List[dict]:
+    """Parse TDX block file binary data into a list of dicts.
+
+    Block file format (from pytdx BlockReader):
+    - 384 bytes header (skip)
+    - u16 num_blocks
+    - For each block:
+      - 9 bytes blockname (GBK, null-terminated)
+      - u16 stock_count
+      - u16 block_type
+      - For each stock: 7 bytes code (UTF-8, null-terminated)
+      - Padding to 2800 bytes total per block entry
+
+    Returns list of dicts with keys: blockname, block_type, code_index, code.
+    """
+    import struct
+
+    if len(data) < 386:
+        return []
+
+    pos = 384
+    (num,) = struct.unpack("<H", data[pos:pos + 2])
+    pos += 2
+
+    results = []
+    for _ in range(num):
+        if pos + 9 > len(data):
+            break
+
+        blockname_raw = data[pos:pos + 9]
+        pos += 9
+        blockname = blockname_raw.decode("gbk", "ignore").rstrip("\x00")
+
+        if pos + 4 > len(data):
+            break
+        stock_count, block_type = struct.unpack("<HH", data[pos:pos + 4])
+        pos += 4
+        block_stock_begin = pos
+
+        for code_index in range(stock_count):
+            if pos + 7 > len(data):
+                break
+            one_code = data[pos:pos + 7].decode("utf-8", "ignore").rstrip("\x00")
+            pos += 7
+            results.append({
+                "blockname": blockname,
+                "block_type": block_type,
+                "code_index": code_index,
+                "code": one_code,
+            })
+
+        # Each block entry is padded to 2800 bytes from the stock data start
+        pos = block_stock_begin + 2800
+
+    return results
 
 
 class Quotes:
@@ -188,13 +256,26 @@ class Quotes:
         return self.bars(symbol=symbol, frequency=frequency, start=start, count=count, backend=backend, **kwargs)
 
     # ---------------------------------------------------------------
-    #  index  —  指数数据 (bars 别名)
+    #  index_bars  —  指数K线 (含涨跌家数)
     # ---------------------------------------------------------------
-    def index(self, symbol: str = '000001', frequency: int = 9, start: int = 0, count: int = 10, backend: str = 'pandas', **kwargs):
+    def index_bars(self, symbol: str = '000001', frequency: int = 9, start: int = 0, count: int = 10, backend: str = 'pandas', **kwargs):
         """
-        Fetch index K-line data. Alias for bars() that auto-detects index market code.
+        Fetch index K-line bars. Same as bars() but includes up_count/down_count.
+        Returns DataFrame with columns: datetime, open, high, low, close, vol, amount, up_count, down_count.
+        Auto-detects index market: 000xxx/88xxxx/99xxxx -> SH, 399xxx -> SZ.
         """
-        return self.bars(symbol=symbol, frequency=frequency, start=start, count=count, backend=backend, **kwargs)
+        self._ensure_connected()
+        market = _index_market_code(symbol)
+        try:
+            res = self.client.get_index_bars(category=frequency, market=market, code=symbol, start=start, count=count)
+            return to_df(res, backend=backend)
+        except Exception:
+            logger.exception("Failed to fetch index bars for symbol=%s", symbol)
+            self.disconnect()
+            raise
+
+    # alias for backward compatibility
+    index = index_bars
 
     # ---------------------------------------------------------------
     #  xdxr  —  除权除息
@@ -309,6 +390,167 @@ class Quotes:
             return result
         except Exception:
             logger.exception("Failed to fetch F10 for symbol=%s", symbol)
+            self.disconnect()
+            raise
+
+    # ---------------------------------------------------------------
+    #  minute_data  —  当日分时数据
+    # ---------------------------------------------------------------
+    def minute_data(self, symbol: str = '600036', backend: str = 'pandas', **kwargs):
+        """
+        Fetch intraday minute-by-minute price/volume data for today.
+        Returns DataFrame with columns: price, vol.
+        """
+        self._ensure_connected()
+        market = _market_code(symbol)
+        try:
+            res = self.client.get_minute_time_data(market=market, code=symbol)
+            return to_df(res, backend=backend)
+        except Exception:
+            logger.exception("Failed to fetch minute data for symbol=%s", symbol)
+            self.disconnect()
+            raise
+
+    # ---------------------------------------------------------------
+    #  history_minute_data  —  历史分时数据
+    # ---------------------------------------------------------------
+    def history_minute_data(self, symbol: str = '600036', date: int = 20260101, backend: str = 'pandas', **kwargs):
+        """
+        Fetch minute-by-minute price/volume data for a historical date.
+        date: YYYYMMDD format integer, e.g. 20260520
+        Returns DataFrame with columns: price, vol.
+        """
+        self._ensure_connected()
+        market = _market_code(symbol)
+        try:
+            res = self.client.get_history_minute_time_data(market=market, code=symbol, date=date)
+            return to_df(res, backend=backend)
+        except Exception:
+            logger.exception("Failed to fetch history minute data for symbol=%s date=%d", symbol, date)
+            self.disconnect()
+            raise
+
+    # ---------------------------------------------------------------
+    #  history_transactions  —  历史分笔成交
+    # ---------------------------------------------------------------
+    def history_transactions(self, symbol: str = '600036', date: int = 20260101, start: int = 0, count: int = 30, backend: str = 'pandas', **kwargs):
+        """
+        Fetch tick-level transaction data for a historical date.
+        date: YYYYMMDD format integer, e.g. 20260520
+        Returns DataFrame with columns: time, price, vol, buyorsell.
+        """
+        self._ensure_connected()
+        market = _market_code(symbol)
+        try:
+            res = self.client.get_history_transaction_data(
+                market=market, code=symbol, start=start, count=count, date=date
+            )
+            return to_df(res, backend=backend)
+        except Exception:
+            logger.exception("Failed to fetch history transactions for symbol=%s date=%d", symbol, date)
+            self.disconnect()
+            raise
+
+    # ---------------------------------------------------------------
+    #  block_meta  —  板块元数据
+    # ---------------------------------------------------------------
+    def block_meta(self, block_file: str = 'block_zs.dat') -> dict:
+        """
+        Get block file metadata (size, hash).
+        block_file: one of 'block_zs.dat' (指数), 'block_gn.dat' (概念),
+                    'block_fg.dat' (风格), 'block_hy.dat' (行业), 'block.dat' (通用)
+        Returns dict with keys: size, hash_value.
+        """
+        self._ensure_connected()
+        try:
+            return self.client.get_block_info_meta(block_file=block_file)
+        except Exception:
+            logger.exception("Failed to fetch block meta for %s", block_file)
+            self.disconnect()
+            raise
+
+    # ---------------------------------------------------------------
+    #  block_info  —  板块详情 (成分股列表)
+    # ---------------------------------------------------------------
+    def block_info(self, block_file: str = 'block_zs.dat', backend: str = 'pandas', **kwargs):
+        """
+        Get block sector data (板块成分股).
+        Downloads the block file from TDX server in chunks and parses it.
+        Returns DataFrame with columns: blockname, block_type, code_index, code.
+        """
+        self._ensure_connected()
+        try:
+            meta = self.client.get_block_info_meta(block_file=block_file)
+            if not meta:
+                return to_df([], backend=backend)
+
+            file_size = meta['size']
+            one_chunk = 0x7530  # 30000 bytes
+            file_content = bytearray()
+
+            chunks = (file_size + one_chunk - 1) // one_chunk
+            for i in range(chunks):
+                offset = i * one_chunk
+                logger.info("Downloading block %s: chunk %d/%d", block_file, i + 1, chunks)
+                chunk = self.client.get_block_info(block_file=block_file, start=offset, size=file_size)
+                file_content.extend(chunk)
+
+            # Parse block file (same format as pytdx BlockReader)
+            records = _parse_block_data(file_content)
+            return to_df(records, backend=backend)
+        except Exception:
+            logger.exception("Failed to fetch block info for %s", block_file)
+            self.disconnect()
+            raise
+
+    # ---------------------------------------------------------------
+    #  k  —  按日期范围查询K线
+    # ---------------------------------------------------------------
+    def k(self, symbol: str = '600036', begin: Optional[str] = None, end: Optional[str] = None,
+          frequency: int = 9, backend: str = 'pandas', **kwargs):
+        """
+        Fetch K-line bars within a date range.
+        begin/end: date strings like '2026-01-01' or '20260101'.
+                   If None, fetches from the earliest/latest available.
+        Returns DataFrame with the same columns as bars().
+        """
+        import datetime as _dt
+
+        self._ensure_connected()
+        market = _market_code(symbol)
+
+        # Normalize dates
+        def _parse_date(s):
+            if s is None:
+                return None
+            s = str(s).replace('-', '')
+            return _dt.date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+
+        begin_dt = _parse_date(begin)
+        end_dt = _parse_date(end)
+
+        try:
+            # Fetch a large batch and filter by date
+            res = self.client.get_security_bars(
+                category=frequency, market=market, code=symbol, start=0, count=800
+            )
+
+            if begin_dt or end_dt:
+                filtered = []
+                for bar in res:
+                    dt_str = bar.get("datetime", "")
+                    if len(dt_str) >= 10:
+                        bar_dt = _parse_date(dt_str[:10])
+                        if begin_dt and bar_dt and bar_dt < begin_dt:
+                            continue
+                        if end_dt and bar_dt and bar_dt > end_dt:
+                            continue
+                    filtered.append(bar)
+                res = filtered
+
+            return to_df(res, backend=backend)
+        except Exception:
+            logger.exception("Failed to fetch k data for symbol=%s", symbol)
             self.disconnect()
             raise
 
