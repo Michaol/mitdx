@@ -601,7 +601,10 @@ class TestParseBlockData:
         ]
 
     def test_differential_against_pytdx(self):
-        from pytdx.reader.block_reader import BlockReader
+        # pytdx is an optional reference implementation (dev environments);
+        # the synthetic-byte tests above pin the same behavior without it.
+        block_reader = pytest.importorskip("pytdx.reader.block_reader")
+        BlockReader = block_reader.BlockReader
         data = build_block_file([
             ("银行", 2, ["600036", "601398", "000001"]),
             ("概念A", 1, ["300750", "002594"]),
