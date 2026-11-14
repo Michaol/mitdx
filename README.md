@@ -30,6 +30,17 @@
 
 ## Changelog
 
+### v1.1.12 (2026-11-14)
+
+SonarCloud 质量门禁闭环（新代码安全评级 + 重复率两项 ERROR 清零）：
+
+- `network.rs` 协议解析提取共享助手：bars/index_bars 请求构造与价格计算、minute/history-minute 解析循环、分笔记录前缀——消除新代码重复块（门禁 4.6% → 达标），请求包字节级不变。
+- `affair`：文件名验证后追加 `os.path.basename` 归一化，使净化点对污点分析可见（S8707）；`downdir` 为用户自选目录的设计意图流，按 FALSE_POSITIVE 审查关闭。
+- `quotes`：切片比较改 `startswith`（S6659）；`Union` → `|` 类型语法（S6546，`__future__` annotations 保持 Python 3.9 兼容）。
+
+<details>
+<summary>历史版本</summary>
+
 ### v1.1.11 (2026-11-14)
 
 代码审查全量修复（24 项发现 + 终审 9 项 + Sonar 反馈），离线测试 262 + Rust 单元测试 35 全部通过。
@@ -61,9 +72,6 @@
 - 补充 MIT LICENSE；CI release 权限收紧（仅 id-token）；版本号三处统一。
 - Sonar S3776/S8513/S125/S6546 清零；9 个 S1313 hotspot 审查为 SAFE（公开行情服务器地址）。
 - `test_calendar` 标记 `network`；README 开发指引改为 `pytest -m "not network"`。
-
-<details>
-<summary>历史版本</summary>
 
 ### v1.1.10 (2026-05-26)
 

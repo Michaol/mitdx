@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import shutil
 import struct
@@ -172,8 +173,10 @@ class Affair:
         if not filename:
             raise NotImplementedError("Batch downloading all files is currently not supported. Provide 'filename'.")
         # Validate before any I/O: the name may come from the server and is
-        # joined into the local write path below.
+        # joined into the local write path below. basename() is a no-op after
+        # validation but makes the sanitization visible to taint analysis.
         _validate_filename(filename)
+        filename = os.path.basename(filename)
 
         downdir_path = Path(downdir)
         downdir_path.mkdir(parents=True, exist_ok=True)
@@ -191,6 +194,7 @@ class Affair:
         if not filename:
             raise ValueError("Filename must be provided")
         _validate_filename(filename)
+        filename = os.path.basename(filename)
 
         filepath = Path(downdir) / filename
         if not filepath.exists():

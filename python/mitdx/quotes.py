@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 import datetime
 import logging
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 from mitdx._core import TdxClient, ping_servers
 from mitdx.utils import to_df
 from mitdx.consts import (
@@ -44,7 +46,7 @@ def _market_code(symbol: str) -> int:
     Accepts prefixed symbols ('sh600036', 'SZ000001').
     """
     s = _normalize_code(symbol)
-    if s and s[0] in ("5", "6", "9", "7"):
+    if s.startswith(("5", "6", "9", "7")):
         return MARKET_SH
     return MARKET_SZ
 
@@ -56,7 +58,7 @@ def _index_market_code(symbol: str) -> int:
     Accepts prefixed symbols ('sh000001', 'SZ399001').
     """
     s = _normalize_code(symbol)
-    if s[:3] == "000" or s[:2] in ("88", "99"):
+    if s.startswith("000") or s.startswith(("88", "99")):
         return MARKET_SH
     return MARKET_SZ
 
@@ -418,7 +420,7 @@ class Quotes:
     # ---------------------------------------------------------------
     #  quotes  —  实时行情快照 (五档盘口)
     # ---------------------------------------------------------------
-    def quotes(self, symbols: Union[str, List[str], List[Tuple[int, str]]] = '600036', backend: str = 'pandas', **kwargs):
+    def quotes(self, symbols: str | List[str] | List[Tuple[int, str]] = '600036', backend: str = 'pandas', **kwargs):
         """
         Fetch real-time quote snapshots (5-level order book).
         symbols can be:

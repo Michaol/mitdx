@@ -217,25 +217,7 @@ impl TdxClient {
         count: u16,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let stream = self.require_stream()?;
-        let code_buf = Self::code_bytes(code);
-
-        // Build request packet
-        let mut req = Vec::with_capacity(38);
-        req.extend_from_slice(&0x10c_u16.to_le_bytes());
-        req.extend_from_slice(&0x01016408_u32.to_le_bytes());
-        req.extend_from_slice(&0x1c_u16.to_le_bytes()); // data length: 28 bytes
-        req.extend_from_slice(&0x1c_u16.to_le_bytes()); // data length (dup)
-        req.extend_from_slice(&CMD_ID_BARS.to_le_bytes());
-        req.extend_from_slice(&(market as u16).to_le_bytes());
-        req.extend_from_slice(&code_buf);
-
-        req.extend_from_slice(&category.to_le_bytes());
-        req.extend_from_slice(&1u16.to_le_bytes()); // unknown flag
-        req.extend_from_slice(&start.to_le_bytes());
-        req.extend_from_slice(&count.to_le_bytes());
-        req.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        req.extend_from_slice(&0u32.to_le_bytes()); // reserved
-        req.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        let req = Self::build_bars_request(category, market, code, start, count);
 
         // F13: blocking socket I/O runs with the GIL released; the request was
         // built above and the response is parsed into Python objects below.
@@ -266,14 +248,9 @@ impl TdxClient {
             };
             pos = new_pos;
 
-            let (mut price_open_diff, p1) = get_price(&data, pos);
-            pos = p1;
-            let (price_close_diff, p2) = get_price(&data, pos);
-            pos = p2;
-            let (price_high_diff, p3) = get_price(&data, pos);
-            pos = p3;
-            let (price_low_diff, p4) = get_price(&data, pos);
-            pos = p4;
+            let (price_open_diff, price_close_diff, price_high_diff, price_low_diff, new_pos) =
+                Self::read_bar_diffs(&data, pos);
+            pos = new_pos;
 
             // Boundary check: need 8 more bytes (vol u32 + amount u32)
             if pos + 8 > data.len() {
@@ -294,24 +271,17 @@ impl TdxClient {
             let amount = get_volume(db_vol_raw);
             pos += 4;
 
-            let open = ((price_open_diff + pre_diff_base) as f64) / 1000.0;
-            price_open_diff = price_open_diff.wrapping_add(pre_diff_base);
-            let close = ((price_open_diff + price_close_diff) as f64) / 1000.0;
-            let high = ((price_open_diff + price_high_diff) as f64) / 1000.0;
-            let low = ((price_open_diff + price_low_diff) as f64) / 1000.0;
-
-            pre_diff_base = price_open_diff.wrapping_add(price_close_diff);
+            let (open, high, low, close, new_base) = Self::bar_prices(
+                price_open_diff,
+                price_close_diff,
+                price_high_diff,
+                price_low_diff,
+                pre_diff_base,
+            );
+            pre_diff_base = new_base;
 
             let dt_str = format!("{}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, minute);
-
-            let dict = pyo3::types::PyDict::new(py);
-            dict.set_item("datetime", dt_str)?;
-            dict.set_item("open", open)?;
-            dict.set_item("high", high)?;
-            dict.set_item("low", low)?;
-            dict.set_item("close", close)?;
-            dict.set_item("vol", vol)?;
-            dict.set_item("amount", amount)?;
+            let dict = Self::bar_dict(py, &dt_str, (open, high, low, close), vol, amount)?;
 
             results.push(dict.into_any().unbind());
         }
@@ -469,6 +439,141 @@ impl TdxClient {
         let len = std::cmp::min(6, cd.len());
         buf[..len].copy_from_slice(&cd[..len]);
         buf
+    }
+
+    // ---------------------------------------------------------------
+    //  Shared protocol helpers (extracted to remove duplicated code
+    //  between the security/index bars, minute and tick methods)
+    // ---------------------------------------------------------------
+
+    /// Build the K-line request packet shared by `get_security_bars` and
+    /// `get_index_bars`: both use command 0x052D with the identical layout.
+    /// Byte-for-byte the same as the previous inline construction.
+    fn build_bars_request(category: u16, market: u8, code: &str, start: u16, count: u16) -> Vec<u8> {
+        let code_buf = Self::code_bytes(code);
+        let mut req = Vec::with_capacity(38);
+        req.extend_from_slice(&0x10c_u16.to_le_bytes());
+        req.extend_from_slice(&0x01016408_u32.to_le_bytes());
+        req.extend_from_slice(&0x1c_u16.to_le_bytes()); // data length: 28 bytes
+        req.extend_from_slice(&0x1c_u16.to_le_bytes()); // data length (dup)
+        req.extend_from_slice(&CMD_ID_BARS.to_le_bytes());
+        req.extend_from_slice(&(market as u16).to_le_bytes());
+        req.extend_from_slice(&code_buf);
+        req.extend_from_slice(&category.to_le_bytes());
+        req.extend_from_slice(&1u16.to_le_bytes()); // unknown flag
+        req.extend_from_slice(&start.to_le_bytes());
+        req.extend_from_slice(&count.to_le_bytes());
+        req.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        req.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        req.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        req
+    }
+
+    /// Read the four cumulative price diffs (open/close/high/low) of a K-line
+    /// record, shared by security and index bars. Uses unchecked `get_price`
+    /// exactly like the original loops: at end-of-buffer it yields `(0, pos)`
+    /// and the caller's vol/amount boundary check drops the partial record.
+    fn read_bar_diffs(data: &[u8], pos: usize) -> (i64, i64, i64, i64, usize) {
+        let (open_diff, p1) = get_price(data, pos);
+        let (close_diff, p2) = get_price(data, p1);
+        let (high_diff, p3) = get_price(data, p2);
+        let (low_diff, p4) = get_price(data, p3);
+        (open_diff, close_diff, high_diff, low_diff, p4)
+    }
+
+    /// Reconstruct absolute OHLC prices from a record's diffs and the previous
+    /// record's close base (`pre_diff_base`). Pure arithmetic shared by
+    /// security and index bars: `wrapping_add` for the base updates, /1000.0
+    /// scaling. Returns (open, high, low, close, next base).
+    fn bar_prices(
+        open_diff: i64,
+        close_diff: i64,
+        high_diff: i64,
+        low_diff: i64,
+        base: i64,
+    ) -> (f64, f64, f64, f64, i64) {
+        let open = ((open_diff + base) as f64) / 1000.0;
+        let open_abs = open_diff.wrapping_add(base);
+        let close = ((open_abs + close_diff) as f64) / 1000.0;
+        let high = ((open_abs + high_diff) as f64) / 1000.0;
+        let low = ((open_abs + low_diff) as f64) / 1000.0;
+        let new_base = open_abs.wrapping_add(close_diff);
+        (open, high, low, close, new_base)
+    }
+
+    /// Build the datetime/OHLC/vol/amount dict shared by security and index
+    /// bar records. `prices` is (open, high, low, close) as returned by
+    /// `bar_prices`. Returns the `Bound` dict (not `Py<PyAny>`) so index bars
+    /// can append their up_count/down_count fields afterwards.
+    fn bar_dict<'py>(
+        py: Python<'py>,
+        dt_str: &str,
+        prices: (f64, f64, f64, f64),
+        vol: f64,
+        amount: f64,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let (open, high, low, close) = prices;
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("datetime", dt_str)?;
+        dict.set_item("open", open)?;
+        dict.set_item("high", high)?;
+        dict.set_item("low", low)?;
+        dict.set_item("close", close)?;
+        dict.set_item("vol", vol)?;
+        dict.set_item("amount", amount)?;
+        Ok(dict)
+    }
+
+    /// Parse the minute-record array shared by `get_minute_time_data` and
+    /// `get_history_minute_time_data`: both responses carry identical
+    /// price/reserved/vol varint records with cumulative price diffs.
+    /// `pos` is the first record offset (4 for today, 6 for history).
+    fn parse_minute_records(
+        py: Python<'_>,
+        data: &[u8],
+        mut pos: usize,
+        num: u16,
+    ) -> PyResult<Vec<Py<PyAny>>> {
+        let mut last_price: i64 = 0;
+        let mut results = Vec::with_capacity(num as usize);
+
+        'record: for _ in 0..num {
+            if pos >= data.len() {
+                break;
+            }
+
+            let (price_raw, p1) = read_price!('record, &data, pos);
+            pos = p1;
+            let (_reserved, p2) = read_price!('record, &data, pos);
+            pos = p2;
+            let (vol, p3) = read_price!('record, &data, pos);
+            pos = p3;
+
+            // F9: truncated record — stop instead of emitting zero-filled data.
+            if pos > data.len() {
+                break;
+            }
+
+            last_price = last_price.wrapping_add(price_raw);
+
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("price", (last_price as f64) / 100.0)?;
+            dict.set_item("vol", vol)?;
+
+            results.push(dict.into_any().unbind());
+        }
+
+        Ok(results)
+    }
+
+    /// Shared prefix of a tick (分笔) record: HH:MM time, cumulative price
+    /// diff and volume. Used by both transaction loops; `None` on truncation
+    /// mirrors `read_price!` breaking the caller's loop (get_price_checked).
+    fn read_tick_prefix(data: &[u8], pos: usize) -> Option<(u32, u32, i64, i64, usize)> {
+        let (hour, minute, p) = get_time(data, pos)?;
+        let (price_raw, p1) = get_price_checked(data, p)?;
+        let (vol, p2) = get_price_checked(data, p1)?;
+        Some((hour, minute, price_raw, vol, p2))
     }
 }
 
@@ -660,16 +765,12 @@ impl TdxClient {
         let mut results = Vec::with_capacity(num as usize);
 
         'record: for _ in 0..num {
-            let (hour, minute, new_pos) = match get_time(&data, pos) {
+            let (hour, minute, price_raw, vol, new_pos) = match Self::read_tick_prefix(&data, pos) {
                 Some(v) => v,
                 None => break,
             };
             pos = new_pos;
 
-            let (price_raw, p1) = read_price!('record, &data, pos);
-            pos = p1;
-            let (vol, p2) = read_price!('record, &data, pos);
-            pos = p2;
             let (num_trades, p3) = read_price!('record, &data, pos);
             pos = p3;
             let (buyorsell, p4) = read_price!('record, &data, pos);
@@ -1244,24 +1345,8 @@ impl TdxClient {
         count: u16,
     ) -> PyResult<Vec<Py<PyAny>>> {
         let stream = self.require_stream()?;
-        let code_buf = Self::code_bytes(code);
-
         // Same packet structure as get_security_bars
-        let mut req = Vec::with_capacity(38);
-        req.extend_from_slice(&0x10c_u16.to_le_bytes());
-        req.extend_from_slice(&0x01016408_u32.to_le_bytes());
-        req.extend_from_slice(&0x1c_u16.to_le_bytes());
-        req.extend_from_slice(&0x1c_u16.to_le_bytes());
-        req.extend_from_slice(&CMD_ID_BARS.to_le_bytes());
-        req.extend_from_slice(&(market as u16).to_le_bytes());
-        req.extend_from_slice(&code_buf);
-        req.extend_from_slice(&category.to_le_bytes());
-        req.extend_from_slice(&1u16.to_le_bytes());
-        req.extend_from_slice(&start.to_le_bytes());
-        req.extend_from_slice(&count.to_le_bytes());
-        req.extend_from_slice(&0u32.to_le_bytes());
-        req.extend_from_slice(&0u32.to_le_bytes());
-        req.extend_from_slice(&0u16.to_le_bytes());
+        let req = Self::build_bars_request(category, market, code, start, count);
 
         // F13: blocking socket I/O runs with the GIL released; the request was
         // built above and the response is parsed into Python objects below.
@@ -1288,14 +1373,9 @@ impl TdxClient {
                 };
             pos = new_pos;
 
-            let (mut price_open_diff, p1) = get_price(&data, pos);
-            pos = p1;
-            let (price_close_diff, p2) = get_price(&data, pos);
-            pos = p2;
-            let (price_high_diff, p3) = get_price(&data, pos);
-            pos = p3;
-            let (price_low_diff, p4) = get_price(&data, pos);
-            pos = p4;
+            let (price_open_diff, price_close_diff, price_high_diff, price_low_diff, new_pos) =
+                Self::read_bar_diffs(&data, pos);
+            pos = new_pos;
 
             // Need 12 more bytes: vol(4) + amount(4) + up_count(2) + down_count(2)
             if pos + 12 > data.len() {
@@ -1316,24 +1396,17 @@ impl TdxClient {
             let down_count = parse_u16_le(&data, pos, "down_count")?;
             pos += 2;
 
-            let open = ((price_open_diff + pre_diff_base) as f64) / 1000.0;
-            price_open_diff = price_open_diff.wrapping_add(pre_diff_base);
-            let close = ((price_open_diff + price_close_diff) as f64) / 1000.0;
-            let high = ((price_open_diff + price_high_diff) as f64) / 1000.0;
-            let low = ((price_open_diff + price_low_diff) as f64) / 1000.0;
-
-            pre_diff_base = price_open_diff.wrapping_add(price_close_diff);
+            let (open, high, low, close, new_base) = Self::bar_prices(
+                price_open_diff,
+                price_close_diff,
+                price_high_diff,
+                price_low_diff,
+                pre_diff_base,
+            );
+            pre_diff_base = new_base;
 
             let dt_str = format!("{}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, minute);
-
-            let dict = pyo3::types::PyDict::new(py);
-            dict.set_item("datetime", dt_str)?;
-            dict.set_item("open", open)?;
-            dict.set_item("high", high)?;
-            dict.set_item("low", low)?;
-            dict.set_item("close", close)?;
-            dict.set_item("vol", vol)?;
-            dict.set_item("amount", amount)?;
+            let dict = Self::bar_dict(py, &dt_str, (open, high, low, close), vol, amount)?;
             dict.set_item("up_count", up_count)?;
             dict.set_item("down_count", down_count)?;
 
@@ -1377,38 +1450,8 @@ impl TdxClient {
         }
 
         let num = parse_u16_le(&data, 0, "minute count")?;
-        let mut pos = 4; // skip 2 bytes count + 2 bytes reserved
-        let mut last_price: i64 = 0;
-
-        let mut results = Vec::with_capacity(num as usize);
-
-        'record: for _ in 0..num {
-            if pos >= data.len() {
-                break;
-            }
-
-            let (price_raw, p1) = read_price!('record, &data, pos);
-            pos = p1;
-            let (_reserved, p2) = read_price!('record, &data, pos);
-            pos = p2;
-            let (vol, p3) = read_price!('record, &data, pos);
-            pos = p3;
-
-            // F9: truncated record — stop instead of emitting zero-filled data.
-            if pos > data.len() {
-                break;
-            }
-
-            last_price = last_price.wrapping_add(price_raw);
-
-            let dict = pyo3::types::PyDict::new(py);
-            dict.set_item("price", (last_price as f64) / 100.0)?;
-            dict.set_item("vol", vol)?;
-
-            results.push(dict.into_any().unbind());
-        }
-
-        Ok(results)
+        let pos = 4; // skip 2 bytes count + 2 bytes reserved
+        Self::parse_minute_records(py, &data, pos, num)
     }
 
     // ===============================================================
@@ -1446,38 +1489,8 @@ impl TdxClient {
         }
 
         let num = parse_u16_le(&data, 0, "history minute count")?;
-        let mut pos = 6; // skip 2 bytes count + 4 bytes unknown (pytdx: pos += 6)
-        let mut last_price: i64 = 0;
-
-        let mut results = Vec::with_capacity(num as usize);
-
-        'record: for _ in 0..num {
-            if pos >= data.len() {
-                break;
-            }
-
-            let (price_raw, p1) = read_price!('record, &data, pos);
-            pos = p1;
-            let (_reserved, p2) = read_price!('record, &data, pos);
-            pos = p2;
-            let (vol, p3) = read_price!('record, &data, pos);
-            pos = p3;
-
-            // F9: truncated record — stop instead of emitting zero-filled data.
-            if pos > data.len() {
-                break;
-            }
-
-            last_price = last_price.wrapping_add(price_raw);
-
-            let dict = pyo3::types::PyDict::new(py);
-            dict.set_item("price", (last_price as f64) / 100.0)?;
-            dict.set_item("vol", vol)?;
-
-            results.push(dict.into_any().unbind());
-        }
-
-        Ok(results)
+        let pos = 6; // skip 2 bytes count + 4 bytes unknown (pytdx: pos += 6)
+        Self::parse_minute_records(py, &data, pos, num)
     }
 
     // ===============================================================
@@ -1529,16 +1542,12 @@ impl TdxClient {
                 break;
             }
 
-            let (hour, minute, new_pos) = match get_time(&data, pos) {
+            let (hour, minute, price_raw, vol, new_pos) = match Self::read_tick_prefix(&data, pos) {
                 Some(v) => v,
                 None => break,
             };
             pos = new_pos;
 
-            let (price_raw, p1) = read_price!('record, &data, pos);
-            pos = p1;
-            let (vol, p2) = read_price!('record, &data, pos);
-            pos = p2;
             let (buyorsell, p3) = read_price!('record, &data, pos);
             pos = p3;
             let (_reserved, p4) = read_price!('record, &data, pos);
@@ -1724,6 +1733,159 @@ mod tests {
         // Longer than 6 bytes: keep only the first 6 (pytdx <6s> behavior).
         assert_eq!(TdxClient::code_bytes("6000361234"), *b"600036");
         assert_eq!(TdxClient::code_bytes("0000000000"), *b"000000");
+    }
+
+    // ---- shared protocol helpers (bars / minute / tick) ----
+
+    #[test]
+    fn bars_request_byte_exact() {
+        // Hand-built expected packet for (category=9, market=1, "600036", 0, 100).
+        let expected: Vec<u8> = vec![
+            0x0c, 0x01, // 0x010c u16
+            0x08, 0x64, 0x01, 0x01, // 0x01016408 u32
+            0x1c, 0x00, // data length: 28 bytes
+            0x1c, 0x00, // data length (dup)
+            0x2d, 0x05, // CMD_ID_BARS (0x052d)
+            0x01, 0x00, // market = 1 (u16)
+            b'6', b'0', b'0', b'0', b'3', b'6', // code, 6 bytes
+            0x09, 0x00, // category = 9
+            0x01, 0x00, // unknown flag
+            0x00, 0x00, // start = 0
+            0x64, 0x00, // count = 100
+            0x00, 0x00, 0x00, 0x00, // reserved
+            0x00, 0x00, 0x00, 0x00, // reserved
+            0x00, 0x00, // reserved
+        ];
+        let req = TdxClient::build_bars_request(9, 1, "600036", 0, 100);
+        assert_eq!(req.len(), 38);
+        assert_eq!(req, expected);
+
+        // Short code zero-padded, long code truncated; start/count little-endian.
+        let req = TdxClient::build_bars_request(0, 0, "1", 5, 800);
+        assert_eq!(&req[14..20], &[b'1', 0, 0, 0, 0, 0]);
+        assert_eq!(&req[24..26], &5u16.to_le_bytes());
+        assert_eq!(&req[26..28], &800u16.to_le_bytes());
+        let req = TdxClient::build_bars_request(4, 1, "0000011234", 0, 1);
+        assert_eq!(&req[14..20], b"000001");
+    }
+
+    #[test]
+    fn bar_prices_hand_computed() {
+        // First record (base 0): open=10.0, close=10.5, high=11.2, low=9.7.
+        assert_eq!(
+            TdxClient::bar_prices(10_000, 500, 1_200, -300, 0),
+            (10.0, 11.2, 9.7, 10.5, 10_500)
+        );
+        // Chained record: base = previous close (10500).
+        assert_eq!(
+            TdxClient::bar_prices(-200, 100, 300, -400, 10_500),
+            (10.3, 10.6, 9.9, 10.4, 10_400)
+        );
+        // Negative base: diffs can drive prices below zero.
+        assert_eq!(
+            TdxClient::bar_prices(2_000, -1_000, 500, -2_000, -5_000),
+            (-3.0, -2.5, -5.0, -4.0, -4_000)
+        );
+        // Large base near i64::MAX with sane diffs: no overflow.
+        let base = i64::MAX - 1_000;
+        let (open, high, low, close, new_base) = TdxClient::bar_prices(100, 100, 200, -100, base);
+        assert_eq!(new_base, i64::MAX - 800);
+        assert_eq!(open, ((i64::MAX - 900) as f64) / 1000.0);
+        assert_eq!(high, ((i64::MAX - 700) as f64) / 1000.0);
+        assert_eq!(low, ((i64::MAX - 1_000) as f64) / 1000.0);
+        assert_eq!(close, ((i64::MAX - 800) as f64) / 1000.0);
+    }
+
+    #[test]
+    fn parse_minute_records_synthetic_truncated_and_wrapping() {
+        // Records are price/reserved/vol varints; all values here fit one byte.
+        // rec1: +10, 0, 30 | rec2: -5, 0, 40 | rec3: +20, 0, 50
+        let data = [0x0A, 0x00, 0x1E, 0x45, 0x00, 0x28, 0x14, 0x00, 0x32];
+        // The crate is built without pyo3's auto-initialize feature (extension
+        // module); initialize the embedded interpreter for this GIL test.
+        Python::initialize();
+        Python::attach(|py| {
+            let field = |rec: &Py<PyAny>, key: &str| -> f64 {
+                rec.bind(py)
+                    .cast::<pyo3::types::PyDict>()
+                    .unwrap()
+                    .get_item(key)
+                    .unwrap()
+                    .unwrap()
+                    .extract()
+                    .unwrap()
+            };
+
+            // Cumulative price: 10, 10-5=5, 5+20=25 (scaled /100).
+            let records = TdxClient::parse_minute_records(py, &data, 0, 3).unwrap();
+            assert_eq!(records.len(), 3);
+            let prices: Vec<f64> = records.iter().map(|r| field(r, "price")).collect();
+            let vols: Vec<f64> = records.iter().map(|r| field(r, "vol")).collect();
+            assert_eq!(prices, vec![0.10, 0.05, 0.25]);
+            assert_eq!(vols, vec![30.0, 40.0, 50.0]);
+
+            // `pos` offset is honored (call sites pass 4 / 6).
+            let mut prefixed = vec![0xFF; 4];
+            prefixed.extend_from_slice(&data);
+            let records = TdxClient::parse_minute_records(py, &prefixed, 4, 3).unwrap();
+            assert_eq!(records.len(), 3);
+            assert_eq!(field(&records[0], "price"), 0.10);
+
+            // num larger than the buffer: stop at end, no zero-filled records.
+            let records = TdxClient::parse_minute_records(py, &data, 0, 5).unwrap();
+            assert_eq!(records.len(), 3);
+
+            // Truncated mid-record (vol missing): drop the partial record.
+            let records = TdxClient::parse_minute_records(py, &data[..5], 0, 2).unwrap();
+            assert_eq!(records.len(), 1);
+
+            // Truncated varint continuation: same drop behavior.
+            let records = TdxClient::parse_minute_records(py, &[0x0A, 0x00, 0x1E, 0x80], 0, 2)
+                .unwrap();
+            assert_eq!(records.len(), 1);
+
+            // Empty buffer / zero count.
+            assert!(TdxClient::parse_minute_records(py, &[], 0, 3)
+                .unwrap()
+                .is_empty());
+            assert!(TdxClient::parse_minute_records(py, &data, 0, 0)
+                .unwrap()
+                .is_empty());
+
+            // Wrapping accumulation: i64::MAX then +1 wraps to i64::MIN.
+            let mut wrap_data = vec![0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+            wrap_data.extend_from_slice(&[0x00, 0x01]); // reserved=0, vol=1
+            wrap_data.extend_from_slice(&[0x01, 0x00, 0x01]); // price=+1, reserved=0, vol=1
+            let records = TdxClient::parse_minute_records(py, &wrap_data, 0, 2).unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(field(&records[0], "price"), (i64::MAX as f64) / 100.0);
+            assert_eq!(field(&records[1], "price"), (i64::MIN as f64) / 100.0);
+        });
+    }
+
+    #[test]
+    fn read_tick_prefix_normal_and_truncated() {
+        // 09:30 = 570 minutes, price diff +10, vol 30.
+        let mut data = (9u16 * 60 + 30).to_le_bytes().to_vec();
+        data.extend_from_slice(&[0x0A, 0x1E]);
+        assert_eq!(
+            TdxClient::read_tick_prefix(&data, 0),
+            Some((9, 30, 10, 30, 4))
+        );
+        // Offset start.
+        let mut prefixed = vec![0xFF, 0xFF];
+        prefixed.extend_from_slice(&data);
+        assert_eq!(
+            TdxClient::read_tick_prefix(&prefixed, 2),
+            Some((9, 30, 10, 30, 6))
+        );
+        // Truncation at every stage returns None (caller breaks its loop).
+        assert_eq!(TdxClient::read_tick_prefix(&[], 0), None);
+        assert_eq!(TdxClient::read_tick_prefix(&[0x00], 0), None); // time needs 2 bytes
+        assert_eq!(TdxClient::read_tick_prefix(&data[..2], 0), None); // no price
+        assert_eq!(TdxClient::read_tick_prefix(&data[..3], 0), None); // no vol
+        // Truncated price continuation: pos runs past end, next read fails.
+        assert_eq!(TdxClient::read_tick_prefix(&[0x3A, 0x02, 0x80], 0), None);
     }
 
     // ---- quotes_packet_len overflow guard (F6-rust / F16) ----
