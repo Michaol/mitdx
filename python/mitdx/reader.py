@@ -32,22 +32,45 @@ SECURITY_COEFFICIENT: dict[str, list[float]] = {
     "SZ_INDEX": [0.01, 1.0],
     "SZ_FUND": [0.001, 0.01],
     "SZ_BOND": [0.001, 0.01],
+    # BJ (Beijing Stock Exchange) coefficients are UNVERIFIED against live
+    # data. Values deliberately equal the SZ_A_STOCK default that bj files
+    # previously fell through to, so numeric output is unchanged. (mootdx
+    # itself raises NotImplementedError for non-sh/sz exchanges.)
+    "BJ_A_STOCK": [0.01, 0.01],
 }
 
 
 def _get_market(symbol: str) -> str:
-    """Determine market (sh/sz) from symbol code prefix."""
-    s = symbol.lower()
-    if s.startswith("sh") or s.startswith("sz"):
-        return s[:2]
+    """Determine market (sh/sz/bj) from symbol code prefix.
 
-    code = s.removeprefix("sh").removeprefix("sz").removeprefix("#")[:2]
+    Faithful port of mootdx.utils.get_stock_market (source of truth).
+    Rule order matters: the longer SH prefixes in rule 2 ('110', '113',
+    '132', '204') must be tested before the shorter SZ prefixes in rule 3
+    ('13', '20', ...) that they overlap with, otherwise SH bonds/repos
+    would misroute to SZ. Unmatched symbols fall back to 'sh' (the mootdx
+    default). Prefix tuples are verbatim from upstream, including the
+    duplicated '18' and the redundant '1318' (already covered by '13').
+    """
+    # Legacy mitdx preprocessing: strip a leading '#' extended-market marker
+    # before inference (ds routing itself is intentionally out of scope).
+    s = symbol.lower().removeprefix("#")
 
-    # Infer from code prefix
-    if code in ("60", "68", "90", "00", "11", "50", "51", "58", "88", "99"):
-        return "sh"
+    market = "sh"  # mootdx default/fallback
 
-    return "sz"
+    # Rule 1 is case-insensitive here; mootdx only matches sh/sz/SH/SZ and
+    # lets mixed case ('Sh', 'sZ') fall through to the numeric rules.
+    if s.startswith(("sh", "sz")):  # rule 1: explicit prefix wins
+        market = s[:2]
+    elif s.startswith(("50", "51", "60", "68", "90", "110", "113", "132", "204")):  # rule 2
+        market = "sh"
+    elif s.startswith(("00", "12", "13", "18", "15", "16", "18", "20", "30", "39", "115", "1318")):  # rule 3
+        market = "sz"
+    elif s.startswith(("5", "6", "9", "7")):  # rule 4
+        market = "sh"
+    elif s.startswith(("4", "8")):  # rule 5
+        market = "bj"
+
+    return market
 
 
 SZ_MAP = {
@@ -65,6 +88,10 @@ SH_MAP = {
     "18": "SH_BOND", "19": "SH_BOND", "20": "SH_BOND"
 }
 
+BJ_MAP = {
+    "43": "BJ_A_STOCK", "83": "BJ_A_STOCK", "87": "BJ_A_STOCK", "92": "BJ_A_STOCK"
+}
+
 def _get_security_type(filepath: str) -> str:
     """Detect security type from filepath for coefficient lookup."""
     fname = Path(filepath).stem.lower()
@@ -73,7 +100,9 @@ def _get_security_type(filepath: str) -> str:
         return SZ_MAP.get(fname[2:4], "SZ_A_STOCK")
     elif fname.startswith("sh"):
         return SH_MAP.get(fname[2:4], "SH_A_STOCK")
-        
+    elif fname.startswith("bj"):
+        return BJ_MAP.get(fname[2:4], "BJ_A_STOCK")
+
     return "SZ_A_STOCK"
 
 
@@ -85,7 +114,9 @@ class Reader:
         """Create a reader instance.
 
         Args:
-            market: 'std' for standard market (A-shares), 'ext' for extended market
+            market: 'std' for standard market (A-shares); 'ext' returns an
+                ExtReader, which currently behaves identically to StdReader
+                (extended-market ds routing is not implemented).
             tdxdir: Path to TDX installation directory
 
         Returns:
@@ -109,16 +140,24 @@ class ReaderBase:
         self, symbol: str, subdir: str = "lday", suffix: str | list[str] = "day"
     ) -> Optional[Path]:
         """Locate VIPDOC data file for a given symbol."""
-        symbol = Path(symbol).stem
+        # Lowercase for lookup so 'SH600036' resolves on case-sensitive
+        # filesystems (mootdx find_path normalizes case as well).
+        symbol = Path(symbol).stem.lower()
 
+        # TDX sector indices (88****) live under sh, overriding the rules.
         if symbol.startswith("88"):
             market = "sh"
         else:
             market = _get_market(symbol)
 
-        # Ensure symbol has market prefix
-        if not symbol.lower().startswith(("sh", "sz")):
-            symbol = f"{market}{symbol}"
+        # Re-attach the resolved market prefix: strip a leading sh/sz once
+        # (removeprefix-style, NOT mootdx's replace-all-occurrences quirk),
+        # then prepend the lowercase market.
+        if symbol.startswith("sh"):
+            symbol = symbol.removeprefix("sh")
+        elif symbol.startswith("sz"):
+            symbol = symbol.removeprefix("sz")
+        symbol = f"{market}{symbol}"
 
         suffixes = [suffix] if isinstance(suffix, str) else suffix
 
@@ -192,8 +231,12 @@ class StdReader(ReaderBase):
 
 
 class ExtReader(ReaderBase):
-    """Extended market reader (futures, options, etc.).
+    """Extended-market reader placeholder (mootdx API compatibility only).
 
-    Note: Extended market support is experimental.
+    Extended-market (ds) routing is NOT implemented: this class currently
+    behaves identically to StdReader (same vipdoc sh/sz/bj file lookup and
+    parsing). It exists so ``Reader.factory(market='ext')`` keeps returning
+    an ExtReader instance for code written against the mootdx API. The CLI
+    deliberately does not expose 'ext' as a --market choice.
     """
     pass

@@ -4,7 +4,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::protocol::{get_datetime, get_price, get_time, get_volume};
+use crate::protocol::{get_datetime, get_price, get_price_checked, get_time, get_volume};
+use std::net::ToSocketAddrs;
 
 const CONNECT_TIMEOUT: u64 = 5;
 const READ_TIMEOUT: u64 = 10;
@@ -71,45 +72,106 @@ const CMD_ID_BLOCK_META: u16 = 0x02c5;
 // Block info data (板块详情) command
 const CMD_ID_BLOCK_DATA: u16 = 0x06b9;
 
+/// Read one TDX varint field inside a record loop, breaking the loop (via the
+/// label passed as first argument) when the buffer is exhausted. `get_price`
+/// silently returns `(0, pos)` at end-of-buffer, which would emit zero-filled
+/// garbage records on a truncated response; `get_price_checked` returns `None`
+/// there instead. The label must be passed explicitly because macro hygiene
+/// hides call-site labels from the macro body. (F9)
+macro_rules! read_price {
+    ($label:lifetime, $data:expr, $pos:expr) => {
+        match get_price_checked($data, $pos) {
+            Some(v) => v,
+            None => break $label,
+        }
+    };
+}
+
 /// Parse a little-endian u16 from a byte slice at the given offset.
+/// Returns a `PyRuntimeError` (instead of panicking) when the slice is too short.
 fn parse_u16_le(data: &[u8], offset: usize, field: &str) -> PyResult<u16> {
-    data[offset..offset + 2]
-        .try_into()
+    offset
+        .checked_add(2)
+        .and_then(|end| data.get(offset..end))
+        .and_then(|s| s.try_into().ok())
         .map(u16::from_le_bytes)
-        .map_err(|_| {
+        .ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Malformed {} data", field))
         })
 }
 
 /// Parse a little-endian u32 from a byte slice at the given offset.
+/// Returns a `PyRuntimeError` (instead of panicking) when the slice is too short.
 fn parse_u32_le(data: &[u8], offset: usize, field: &str) -> PyResult<u32> {
-    data[offset..offset + 4]
-        .try_into()
+    offset
+        .checked_add(4)
+        .and_then(|end| data.get(offset..end))
+        .and_then(|s| s.try_into().ok())
         .map(u32::from_le_bytes)
-        .map_err(|_| {
+        .ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Malformed {} data", field))
         })
 }
 
-/// Parse address string safely, returning a PyResult error on invalid input.
-fn parse_addr(addr: &str) -> PyResult<std::net::SocketAddr> {
-    addr.parse().map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("Invalid address '{}': {}", addr, e))
-    })
+/// Compute the quotes request payload length (`stock_len * 7 + 12`) without
+/// silent u16 truncation. Returns `PyValueError` when it cannot fit the wire
+/// field (or when `stock_len` itself exceeds u16). (F6-rust)
+fn quotes_packet_len(stock_len: usize) -> PyResult<u16> {
+    let len = stock_len
+        .checked_mul(7)
+        .and_then(|v| v.checked_add(12))
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Too many stocks in one quotes request: {} (length overflow)",
+                stock_len
+            ))
+        })?;
+    if len > u16::MAX as usize {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Too many stocks in one quotes request: {} (packet payload {} bytes exceeds u16 max {})",
+            stock_len, len, u16::MAX
+        )));
+    }
+    if stock_len > u16::MAX as usize {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "Too many stocks in one quotes request: {} (exceeds u16 max {})",
+            stock_len, u16::MAX
+        )));
+    }
+    Ok(len as u16)
 }
 
-/// Drain a setup response: read header, then read+discard the body.
-/// Note: Errors are intentionally swallowed here. Setup responses are handshake
-/// acknowledgements that don't carry meaningful data; if parsing fails we just
-/// skip the body rather than aborting the connection.
+/// Resolve an address string ("host:port", IP literal or hostname) into
+/// candidate socket addresses.
+/// NOTE: DNS resolution itself is blocking; callers must run this off the GIL
+/// (inside `py.detach`, pyo3 0.27's renamed `allow_threads`). (F22)
+fn resolve_addr(addr: &str) -> PyResult<Vec<std::net::SocketAddr>> {
+    let addrs: Vec<std::net::SocketAddr> = addr
+        .to_socket_addrs()
+        .map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("Invalid address '{}': {}", addr, e))
+        })?
+        .collect();
+    if addrs.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "No addresses resolved for '{}'",
+            addr
+        )));
+    }
+    Ok(addrs)
+}
+
+/// Drain a setup response: read the full 16-byte header, then read+discard the
+/// body. Errors are PROPAGATED: a broken handshake must fail `connect` cleanly.
+/// Using a single `read()` for the header could leave the body in the socket on
+/// TCP fragmentation, desyncing every later response. (F10)
 fn drain_setup_response(stream: &mut TcpStream) -> std::io::Result<()> {
     let mut header = [0u8; RESP_HEADER_LEN];
-    if stream.read(&mut header).is_ok() {
-        let zip_size = u16::from_le_bytes(header[12..14].try_into().unwrap_or([0, 0]));
-        if zip_size > 0 {
-            let mut buf = vec![0u8; zip_size as usize];
-            let _ = stream.read_exact(&mut buf);
-        }
+    stream.read_exact(&mut header)?;
+    let zip_size = u16::from_le_bytes([header[12], header[13]]);
+    if zip_size > 0 {
+        let mut buf = vec![0u8; zip_size as usize];
+        stream.read_exact(&mut buf)?;
     }
     Ok(())
 }
@@ -126,52 +188,20 @@ impl TdxClient {
         TdxClient { stream: None }
     }
 
-    pub fn connect(&mut self, ip: &str, port: u16) -> PyResult<bool> {
+    pub fn connect(&mut self, py: Python<'_>, ip: &str, port: u16) -> PyResult<bool> {
         let addr = format!("{}:{}", ip, port);
-        let sock_addr = parse_addr(&addr)?;
-
-        match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(CONNECT_TIMEOUT)) {
-            Ok(mut stream) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT)))
-                    .map_err(|e| {
-                        pyo3::exceptions::PyOSError::new_err(format!(
-                            "Failed to set read timeout: {}",
-                            e
-                        ))
-                    })?;
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT)))
-                    .map_err(|e| {
-                        pyo3::exceptions::PyOSError::new_err(format!(
-                            "Failed to set write timeout: {}",
-                            e
-                        ))
-                    })?;
-
-                // Setup handshake sequence
-                stream.write_all(&SETUP_CMD1)?;
-                drain_setup_response(&mut stream)?;
-
-                stream.write_all(&SETUP_CMD2)?;
-                drain_setup_response(&mut stream)?;
-
-                stream.write_all(&SETUP_CMD3)?;
-                drain_setup_response(&mut stream)?;
-
-                self.stream = Some(stream);
-                Ok(true)
-            }
-            Err(e) => Err(pyo3::exceptions::PyConnectionError::new_err(format!(
-                "Connect failed: {}",
-                e
-            ))),
-        }
+        // F13: DNS resolution, TCP connect and the handshake are all blocking;
+        // run them with the GIL released so other Python threads keep running.
+        let stream = py.detach(|| Self::connect_and_handshake(&addr))?;
+        self.stream = Some(stream);
+        Ok(true)
     }
 
-    pub fn disconnect(&mut self) -> PyResult<()> {
+    pub fn disconnect(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(stream) = self.stream.take() {
-            stream.shutdown(std::net::Shutdown::Both).ok();
+            py.detach(|| {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            });
         }
         Ok(())
     }
@@ -207,8 +237,12 @@ impl TdxClient {
         req.extend_from_slice(&0u32.to_le_bytes()); // reserved
         req.extend_from_slice(&0u16.to_le_bytes()); // reserved
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 2 {
             return Ok(vec![]);
@@ -261,12 +295,12 @@ impl TdxClient {
             pos += 4;
 
             let open = ((price_open_diff + pre_diff_base) as f64) / 1000.0;
-            price_open_diff += pre_diff_base;
+            price_open_diff = price_open_diff.wrapping_add(pre_diff_base);
             let close = ((price_open_diff + price_close_diff) as f64) / 1000.0;
             let high = ((price_open_diff + price_high_diff) as f64) / 1000.0;
             let low = ((price_open_diff + price_low_diff) as f64) / 1000.0;
 
-            pre_diff_base = price_open_diff + price_close_diff;
+            pre_diff_base = price_open_diff.wrapping_add(price_close_diff);
 
             let dt_str = format!("{}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, minute);
 
@@ -287,6 +321,7 @@ impl TdxClient {
 
     pub fn get_report_file(
         &mut self,
+        py: Python<'_>,
         filename: &str,
         offset: u32,
     ) -> PyResult<(u32, std::borrow::Cow<'_, [u8]>)> {
@@ -310,8 +345,12 @@ impl TdxClient {
         fname_buf[..len].copy_from_slice(&bytes[..len]);
         req.extend_from_slice(&fname_buf);
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 4 {
             return Ok((0, std::borrow::Cow::Borrowed(&[])));
@@ -329,6 +368,61 @@ impl TdxClient {
 //  Private (non-PyO3) helpers on TdxClient
 // ---------------------------------------------------------------
 impl TdxClient {
+    /// Blocking connect + handshake. Runs entirely off the GIL (see `connect`).
+    /// Resolves the address (IP literal or hostname), tries each resolved
+    /// SocketAddr with a connect timeout, enables TCP_NODELAY, sets socket
+    /// timeouts, then performs the 3-step setup handshake. (F22, F10, F13)
+    fn connect_and_handshake(addr: &str) -> PyResult<TcpStream> {
+        let addrs = resolve_addr(addr)?;
+        let mut last_err: Option<std::io::Error> = None;
+        let mut connected: Option<TcpStream> = None;
+        for sock_addr in addrs {
+            match TcpStream::connect_timeout(&sock_addr, Duration::from_secs(CONNECT_TIMEOUT)) {
+                Ok(s) => {
+                    connected = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let mut stream = connected.ok_or_else(|| {
+            pyo3::exceptions::PyConnectionError::new_err(format!(
+                "Connect failed: {}",
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no address to connect".to_string())
+            ))
+        })?;
+
+        // F22: disable Nagle so small request packets are sent without delay.
+        stream.set_nodelay(true).map_err(|e| {
+            pyo3::exceptions::PyOSError::new_err(format!("Failed to set TCP_NODELAY: {}", e))
+        })?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(READ_TIMEOUT)))
+            .map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!("Failed to set read timeout: {}", e))
+            })?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT)))
+            .map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!("Failed to set write timeout: {}", e))
+            })?;
+
+        // Setup handshake sequence. Errors propagate so a broken handshake fails
+        // connect cleanly instead of leaving the stream desynced. (F10)
+        stream.write_all(&SETUP_CMD1)?;
+        drain_setup_response(&mut stream)?;
+
+        stream.write_all(&SETUP_CMD2)?;
+        drain_setup_response(&mut stream)?;
+
+        stream.write_all(&SETUP_CMD3)?;
+        drain_setup_response(&mut stream)?;
+
+        Ok(stream)
+    }
+
     fn read_response(stream: &mut TcpStream) -> PyResult<Vec<u8>> {
         let mut header = [0u8; RESP_HEADER_LEN];
         stream.read_exact(&mut header)?;
@@ -402,8 +496,12 @@ impl TdxClient {
         req.push(market);
         req.extend_from_slice(&code_buf);
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 11 {
             return Ok(vec![]);
@@ -541,8 +639,12 @@ impl TdxClient {
         req.extend_from_slice(&start.to_le_bytes());
         req.extend_from_slice(&count.to_le_bytes());
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 2 {
             return Ok(vec![]);
@@ -557,25 +659,31 @@ impl TdxClient {
         let mut last_price: i64 = 0;
         let mut results = Vec::with_capacity(num as usize);
 
-        for _ in 0..num {
+        'record: for _ in 0..num {
             let (hour, minute, new_pos) = match get_time(&data, pos) {
                 Some(v) => v,
                 None => break,
             };
             pos = new_pos;
 
-            let (price_raw, p1) = get_price(&data, pos);
+            let (price_raw, p1) = read_price!('record, &data, pos);
             pos = p1;
-            let (vol, p2) = get_price(&data, pos);
+            let (vol, p2) = read_price!('record, &data, pos);
             pos = p2;
-            let (num_trades, p3) = get_price(&data, pos);
+            let (num_trades, p3) = read_price!('record, &data, pos);
             pos = p3;
-            let (buyorsell, p4) = get_price(&data, pos);
+            let (buyorsell, p4) = read_price!('record, &data, pos);
             pos = p4;
-            let (_reserved, p5) = get_price(&data, pos);
+            let (_reserved, p5) = read_price!('record, &data, pos);
             pos = p5;
 
-            last_price += price_raw;
+            // F9: a truncated continuation can push pos past the buffer end;
+            // drop the incomplete record instead of emitting garbage.
+            if pos > data.len() {
+                break;
+            }
+
+            last_price = last_price.wrapping_add(price_raw);
 
             let dict = pyo3::types::PyDict::new(py);
             dict.set_item("time", format!("{:02}:{:02}", hour, minute))?;
@@ -604,7 +712,9 @@ impl TdxClient {
             return Ok(vec![]);
         }
 
-        let pkg_data_len = (stock_len * 7 + 12) as u16;
+        // F6-rust: compute in usize and reject (PyValueError) instead of silently
+        // truncating the u16 wire fields. G1 batches at 80 stocks in Python.
+        let pkg_data_len = quotes_packet_len(stock_len)?;
 
         let mut req = Vec::with_capacity(20 + stock_len * 7);
         req.extend_from_slice(&0x10c_u16.to_le_bytes());
@@ -614,6 +724,7 @@ impl TdxClient {
         req.extend_from_slice(&CMD_ID_QUOTES.to_le_bytes());
         req.extend_from_slice(&0u32.to_le_bytes());
         req.extend_from_slice(&0u16.to_le_bytes());
+        // Safe cast: quotes_packet_len guarantees stock_len <= 9360 < u16::MAX.
         req.extend_from_slice(&(stock_len as u16).to_le_bytes());
 
         for (market, code) in &stock_list {
@@ -622,8 +733,12 @@ impl TdxClient {
             req.extend_from_slice(&cb);
         }
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 4 {
             return Ok(vec![]);
@@ -639,7 +754,7 @@ impl TdxClient {
 
         let mut results = Vec::with_capacity(num_stock as usize);
 
-        for _ in 0..num_stock {
+        'record: for _ in 0..num_stock {
             if pos + 9 > data.len() {
                 break;
             }
@@ -651,27 +766,27 @@ impl TdxClient {
             // active1 = u16 at pos+7..pos+9, skip
             pos += 9;
 
-            let (price, p1) = get_price(&data, pos);
+            let (price, p1) = read_price!('record, &data, pos);
             pos = p1;
-            let (last_close_diff, p2) = get_price(&data, pos);
+            let (last_close_diff, p2) = read_price!('record, &data, pos);
             pos = p2;
-            let (open_diff, p3) = get_price(&data, pos);
+            let (open_diff, p3) = read_price!('record, &data, pos);
             pos = p3;
-            let (high_diff, p4) = get_price(&data, pos);
+            let (high_diff, p4) = read_price!('record, &data, pos);
             pos = p4;
-            let (low_diff, p5) = get_price(&data, pos);
+            let (low_diff, p5) = read_price!('record, &data, pos);
             pos = p5;
 
             // server time (get_price), reversed_bytes1 (get_price)
-            let (server_time_raw, p6) = get_price(&data, pos);
+            let (server_time_raw, p6) = read_price!('record, &data, pos);
             pos = p6;
-            let (_rb1, p7) = get_price(&data, pos);
+            let (_rb1, p7) = read_price!('record, &data, pos);
             pos = p7;
 
             // vol, cur_vol
-            let (vol, p8) = get_price(&data, pos);
+            let (vol, p8) = read_price!('record, &data, pos);
             pos = p8;
-            let (cur_vol, p9) = get_price(&data, pos);
+            let (cur_vol, p9) = read_price!('record, &data, pos);
             pos = p9;
 
             // amount (u32 -> get_volume)
@@ -683,13 +798,13 @@ impl TdxClient {
             pos += 4;
 
             // s_vol, b_vol, rb2, rb3
-            let (s_vol, pa) = get_price(&data, pos);
+            let (s_vol, pa) = read_price!('record, &data, pos);
             pos = pa;
-            let (b_vol, pb) = get_price(&data, pos);
+            let (b_vol, pb) = read_price!('record, &data, pos);
             pos = pb;
-            let (_rb2, pc) = get_price(&data, pos);
+            let (_rb2, pc) = read_price!('record, &data, pos);
             pos = pc;
-            let (_rb3, pd) = get_price(&data, pos);
+            let (_rb3, pd) = read_price!('record, &data, pos);
             pos = pd;
 
             let cal = |base: i64, diff: i64| -> f64 { (base + diff) as f64 / 100.0 };
@@ -711,13 +826,13 @@ impl TdxClient {
 
             // 5-level bid/ask
             for level in 1..=5u8 {
-                let (bid, pe) = get_price(&data, pos);
+                let (bid, pe) = read_price!('record, &data, pos);
                 pos = pe;
-                let (ask, pf) = get_price(&data, pos);
+                let (ask, pf) = read_price!('record, &data, pos);
                 pos = pf;
-                let (bid_vol, pg) = get_price(&data, pos);
+                let (bid_vol, pg) = read_price!('record, &data, pos);
                 pos = pg;
-                let (ask_vol, ph) = get_price(&data, pos);
+                let (ask_vol, ph) = read_price!('record, &data, pos);
                 pos = ph;
 
                 dict.set_item(format!("bid{}", level), cal(price, bid))?;
@@ -734,11 +849,16 @@ impl TdxClient {
                 pos += 2;
             }
             for _ in 0..4 {
-                let (_, pn) = get_price(&data, pos);
+                let (_, pn) = read_price!('record, &data, pos);
                 pos = pn;
             }
             if pos + 4 <= data.len() {
                 pos += 4;
+            }
+
+            // F9: never emit a record whose decode ran past the buffer end.
+            if pos > data.len() {
+                break;
             }
 
             results.push(dict.into_any().unbind());
@@ -766,8 +886,12 @@ impl TdxClient {
         req.extend_from_slice(&code_buf);
         req.extend_from_slice(&0u32.to_le_bytes());
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 2 {
             return Ok(vec![]);
@@ -816,6 +940,7 @@ impl TdxClient {
     // ===============================================================
     pub fn get_company_info_content(
         &mut self,
+        py: Python<'_>,
         market: u8,
         code: &str,
         filename: &str,
@@ -842,8 +967,12 @@ impl TdxClient {
         req.extend_from_slice(&length.to_le_bytes());
         req.extend_from_slice(&0u32.to_le_bytes()); // reserved
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 12 {
             return Ok(String::new());
@@ -885,15 +1014,20 @@ impl TdxClient {
         req.push(market);
         req.extend_from_slice(&code_buf);
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
-        // Response: 2 bytes count + 7 bytes (market+code) + 136 bytes struct
-        // struct: <fHHIIffffffffffffffffffffffffffffff>
-        //   f32 + u16 + u16 + u32 + u32 + 29×f32 = 4+2+2+4+4+116 = 132... actually
-        //   1f + 2H + 2I + 29f = 4 + 4 + 8 + 116 = 132 bytes
+        // Response: 2 bytes count + 7 bytes (market+code) + 136 bytes struct.
+        // struct (pytdx get_finance_info.py): "<fHHIIffffffffffffffffffffffffffffff"
+        //   1f + 2H + 2I + 30f = 35 values = 4 + 2 + 2 + 4 + 4 + 120 = 136 bytes.
+        // The last two floats are baoliu1 (exposed as meigujingzichan) and baoliu2;
+        // pytdx returns both unscaled. (F14)
         let header_len = 2 + 7; // count(2) + market(1) + code(6)
-        if data.len() < header_len + 132 {
+        if data.len() < header_len + 136 {
             let dict = pyo3::types::PyDict::new(py);
             return Ok(dict.into_any().unbind());
         }
@@ -961,13 +1095,15 @@ impl TdxClient {
         for (idx, name) in fields.iter().enumerate() {
             let off = 16 + idx * 4;
             let val = f(off);
-            // gudongrenshu and meigujingzichan are not scaled
+            // gudongrenshu and meigujingzichan (= baoliu1) are not scaled
             if *name == "gudongrenshu" || *name == "meigujingzichan" {
                 dict.set_item(*name, val)?;
             } else {
                 dict.set_item(*name, val * 10000.0)?;
             }
         }
+        // baoliu2 (offset 132, last of the 30 floats): pytdx returns it raw. (F14)
+        dict.set_item("baoliu2", f(132))?;
 
         Ok(dict.into_any().unbind())
     }
@@ -975,7 +1111,7 @@ impl TdxClient {
     /// Get the total number of securities for a given market.
     /// market: 0 = Shenzhen (深圳), 1 = Shanghai (上海)
     /// Returns the total count of securities.
-    pub fn get_security_count(&mut self, market: u8) -> PyResult<u16> {
+    pub fn get_security_count(&mut self, py: Python<'_>, market: u8) -> PyResult<u16> {
         let stream = self.require_stream()?;
 
         // Build request: 0c 0c 18 6c 00 01 08 00 08 00 4e 04 <market_u16> 75 c7 33 01
@@ -985,8 +1121,12 @@ impl TdxClient {
         req.extend_from_slice(&(market as u16).to_le_bytes());
         req.extend_from_slice(&[0x75, 0xc7, 0x33, 0x01]);
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 2 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -1017,8 +1157,12 @@ impl TdxClient {
         req.extend_from_slice(&(market as u16).to_le_bytes());
         req.extend_from_slice(&start.to_le_bytes());
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 2 {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
@@ -1119,8 +1263,12 @@ impl TdxClient {
         req.extend_from_slice(&0u32.to_le_bytes());
         req.extend_from_slice(&0u16.to_le_bytes());
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 2 {
             return Ok(vec![]);
@@ -1169,12 +1317,12 @@ impl TdxClient {
             pos += 2;
 
             let open = ((price_open_diff + pre_diff_base) as f64) / 1000.0;
-            price_open_diff += pre_diff_base;
+            price_open_diff = price_open_diff.wrapping_add(pre_diff_base);
             let close = ((price_open_diff + price_close_diff) as f64) / 1000.0;
             let high = ((price_open_diff + price_high_diff) as f64) / 1000.0;
             let low = ((price_open_diff + price_low_diff) as f64) / 1000.0;
 
-            pre_diff_base = price_open_diff + price_close_diff;
+            pre_diff_base = price_open_diff.wrapping_add(price_close_diff);
 
             let dt_str = format!("{}-{:02}-{:02} {:02}:{:02}", year, month, day, hour, minute);
 
@@ -1217,8 +1365,12 @@ impl TdxClient {
         req.extend_from_slice(&code_buf);
         req.extend_from_slice(&0u32.to_le_bytes()); // reserved
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 2 {
             return Ok(vec![]);
@@ -1230,19 +1382,24 @@ impl TdxClient {
 
         let mut results = Vec::with_capacity(num as usize);
 
-        for _ in 0..num {
+        'record: for _ in 0..num {
             if pos >= data.len() {
                 break;
             }
 
-            let (price_raw, p1) = get_price(&data, pos);
+            let (price_raw, p1) = read_price!('record, &data, pos);
             pos = p1;
-            let (_reserved, p2) = get_price(&data, pos);
+            let (_reserved, p2) = read_price!('record, &data, pos);
             pos = p2;
-            let (vol, p3) = get_price(&data, pos);
+            let (vol, p3) = read_price!('record, &data, pos);
             pos = p3;
 
-            last_price += price_raw;
+            // F9: truncated record — stop instead of emitting zero-filled data.
+            if pos > data.len() {
+                break;
+            }
+
+            last_price = last_price.wrapping_add(price_raw);
 
             let dict = pyo3::types::PyDict::new(py);
             dict.set_item("price", (last_price as f64) / 100.0)?;
@@ -1277,8 +1434,12 @@ impl TdxClient {
         req.push(market);
         req.extend_from_slice(&code_buf);
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 2 {
             return Ok(vec![]);
@@ -1290,19 +1451,24 @@ impl TdxClient {
 
         let mut results = Vec::with_capacity(num as usize);
 
-        for _ in 0..num {
+        'record: for _ in 0..num {
             if pos >= data.len() {
                 break;
             }
 
-            let (price_raw, p1) = get_price(&data, pos);
+            let (price_raw, p1) = read_price!('record, &data, pos);
             pos = p1;
-            let (_reserved, p2) = get_price(&data, pos);
+            let (_reserved, p2) = read_price!('record, &data, pos);
             pos = p2;
-            let (vol, p3) = get_price(&data, pos);
+            let (vol, p3) = read_price!('record, &data, pos);
             pos = p3;
 
-            last_price += price_raw;
+            // F9: truncated record — stop instead of emitting zero-filled data.
+            if pos > data.len() {
+                break;
+            }
+
+            last_price = last_price.wrapping_add(price_raw);
 
             let dict = pyo3::types::PyDict::new(py);
             dict.set_item("price", (last_price as f64) / 100.0)?;
@@ -1341,8 +1507,12 @@ impl TdxClient {
         req.extend_from_slice(&start.to_le_bytes());
         req.extend_from_slice(&count.to_le_bytes());
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         if data.len() < 2 {
             return Ok(vec![]);
@@ -1354,7 +1524,7 @@ impl TdxClient {
 
         let mut results = Vec::with_capacity(num as usize);
 
-        for _ in 0..num {
+        'record: for _ in 0..num {
             if pos >= data.len() {
                 break;
             }
@@ -1365,16 +1535,21 @@ impl TdxClient {
             };
             pos = new_pos;
 
-            let (price_raw, p1) = get_price(&data, pos);
+            let (price_raw, p1) = read_price!('record, &data, pos);
             pos = p1;
-            let (vol, p2) = get_price(&data, pos);
+            let (vol, p2) = read_price!('record, &data, pos);
             pos = p2;
-            let (buyorsell, p3) = get_price(&data, pos);
+            let (buyorsell, p3) = read_price!('record, &data, pos);
             pos = p3;
-            let (_reserved, p4) = get_price(&data, pos);
+            let (_reserved, p4) = read_price!('record, &data, pos);
             pos = p4;
 
-            last_price += price_raw;
+            // F9: truncated record — stop instead of emitting zero-filled data.
+            if pos > data.len() {
+                break;
+            }
+
+            last_price = last_price.wrapping_add(price_raw);
 
             let dict = pyo3::types::PyDict::new(py);
             dict.set_item("time", format!("{:02}:{:02}", hour, minute))?;
@@ -1410,8 +1585,12 @@ impl TdxClient {
         buf[..len].copy_from_slice(&file_bytes[..len]);
         req.extend_from_slice(&buf);
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         // Response: I(4) size + 1s + 32s hash + 1s = 38 bytes
         if data.len() < 38 {
@@ -1443,6 +1622,7 @@ impl TdxClient {
     /// Returns raw bytes (skip first 4 bytes of response body).
     pub fn get_block_info(
         &mut self,
+        py: Python<'_>,
         block_file: &str,
         start: u32,
         size: u32,
@@ -1463,8 +1643,12 @@ impl TdxClient {
         file_buf[..len].copy_from_slice(&file_bytes[..len]);
         req.extend_from_slice(&file_buf);
 
-        stream.write_all(&req)?;
-        let data = Self::read_response(stream)?;
+        // F13: blocking socket I/O runs with the GIL released; the request was
+        // built above and the response is parsed into Python objects below.
+        let data = py.detach(|| -> PyResult<Vec<u8>> {
+            stream.write_all(&req)?;
+            Self::read_response(stream)
+        })?;
 
         // Response: skip first 4 bytes, return the rest
         if data.len() <= 4 {
@@ -1480,4 +1664,265 @@ impl TdxClient {
 fn decode_gbk(bytes: &[u8]) -> String {
     let (cow, _, _) = encoding_rs::GBK.decode(bytes);
     cow.into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- parse_u16_le / parse_u32_le (F16) ----
+
+    #[test]
+    fn parse_u16_le_ok() {
+        assert_eq!(parse_u16_le(&[0x34, 0x12], 0, "x").unwrap(), 0x1234);
+        assert_eq!(
+            parse_u16_le(&[0xFF, 0x34, 0x12, 0xFF], 1, "x").unwrap(),
+            0x1234
+        );
+        assert_eq!(parse_u16_le(&[0xFF, 0xFF], 0, "x").unwrap(), u16::MAX);
+    }
+
+    #[test]
+    fn parse_u16_le_malformed() {
+        assert!(parse_u16_le(&[], 0, "x").is_err());
+        assert!(parse_u16_le(&[0x01], 0, "x").is_err()); // 1 < 2 bytes
+        assert!(parse_u16_le(&[0x01, 0x02], 1, "x").is_err()); // offset past end
+        assert!(parse_u16_le(&[0x01, 0x02], usize::MAX, "x").is_err()); // no overflow panic
+    }
+
+    #[test]
+    fn parse_u32_le_ok() {
+        assert_eq!(
+            parse_u32_le(&[0x78, 0x56, 0x34, 0x12], 0, "x").unwrap(),
+            0x1234_5678
+        );
+        assert_eq!(
+            parse_u32_le(&[0xAA, 0x78, 0x56, 0x34, 0x12], 1, "x").unwrap(),
+            0x1234_5678
+        );
+    }
+
+    #[test]
+    fn parse_u32_le_malformed() {
+        assert!(parse_u32_le(&[], 0, "x").is_err());
+        assert!(parse_u32_le(&[0x01, 0x02, 0x03], 0, "x").is_err()); // 3 < 4 bytes
+        assert!(parse_u32_le(&[0x01, 0x02, 0x03, 0x04], 1, "x").is_err());
+        assert!(parse_u32_le(&[0x01, 0x02, 0x03, 0x04], usize::MAX, "x").is_err());
+    }
+
+    // ---- code_bytes (F16) ----
+
+    #[test]
+    fn code_bytes_exact_and_padding() {
+        assert_eq!(TdxClient::code_bytes("600036"), *b"600036");
+        assert_eq!(TdxClient::code_bytes("1"), [b'1', 0, 0, 0, 0, 0]);
+        assert_eq!(TdxClient::code_bytes(""), [0u8; 6]);
+    }
+
+    #[test]
+    fn code_bytes_truncation() {
+        // Longer than 6 bytes: keep only the first 6 (pytdx <6s> behavior).
+        assert_eq!(TdxClient::code_bytes("6000361234"), *b"600036");
+        assert_eq!(TdxClient::code_bytes("0000000000"), *b"000000");
+    }
+
+    // ---- quotes_packet_len overflow guard (F6-rust / F16) ----
+
+    #[test]
+    fn quotes_packet_len_normal() {
+        assert_eq!(quotes_packet_len(1).unwrap(), 19);
+        assert_eq!(quotes_packet_len(80).unwrap(), 572); // G1 batch size
+        // Largest stock_len whose payload still fits u16: 9360*7+12 = 65532.
+        assert_eq!(quotes_packet_len(9360).unwrap(), 65532);
+    }
+
+    #[test]
+    fn quotes_packet_len_overflow_rejected() {
+        // 9361*7+12 = 65539 > u16::MAX: must error, not truncate.
+        assert!(quotes_packet_len(9361).is_err());
+        assert!(quotes_packet_len(100_000).is_err());
+        // usize multiplication overflow must also error, not panic.
+        assert!(quotes_packet_len(usize::MAX).is_err());
+        assert!(quotes_packet_len(usize::MAX / 7 + 1).is_err());
+    }
+
+    // ---- resolve_addr (F22) ----
+
+    #[test]
+    fn resolve_addr_ip_literal() {
+        let addrs = resolve_addr("127.0.0.1:7709").unwrap();
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].ip().to_string(), "127.0.0.1");
+        assert_eq!(addrs[0].port(), 7709);
+    }
+
+    #[test]
+    fn resolve_addr_invalid() {
+        assert!(resolve_addr("not an address").is_err());
+        assert!(resolve_addr("127.0.0.1").is_err()); // missing port
+        assert!(resolve_addr("127.0.0.1:99999").is_err()); // port out of range
+        assert!(resolve_addr("").is_err());
+    }
+
+    // ---- loopback helpers (offline: 127.0.0.1 only) ----
+
+    /// Create a connected (client, server) TcpStream pair on loopback.
+    fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        (client, server)
+    }
+
+    /// Build a 16-byte response header with the given zip/unzip sizes.
+    fn make_header(zip_size: u16, unzip_size: u16) -> [u8; RESP_HEADER_LEN] {
+        let mut h = [0u8; RESP_HEADER_LEN];
+        h[12..14].copy_from_slice(&zip_size.to_le_bytes());
+        h[14..16].copy_from_slice(&unzip_size.to_le_bytes());
+        h
+    }
+
+    // ---- drain_setup_response (F10) ----
+
+    #[test]
+    fn drain_reads_fragmented_header_and_exact_body() {
+        let (mut client, mut server) = loopback_pair();
+        let body = [0x11u8; 5];
+        let marker = 0x42u8;
+        let writer = std::thread::spawn(move || {
+            let header = make_header(5, 5);
+            // Deliver the header in two fragments with a pause so a single
+            // read() would previously have returned a partial header.
+            server.write_all(&header[..7]).unwrap();
+            server.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            server.write_all(&header[7..]).unwrap();
+            server.write_all(&body).unwrap();
+            server.write_all(&[marker]).unwrap();
+            server.flush().unwrap();
+        });
+        drain_setup_response(&mut client).unwrap();
+        // The drain must consume exactly header+body: the marker is next.
+        let mut next = [0u8; 1];
+        client.read_exact(&mut next).unwrap();
+        assert_eq!(next[0], marker);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn drain_zero_body() {
+        let (mut client, mut server) = loopback_pair();
+        let header = make_header(0, 0);
+        server.write_all(&header).unwrap();
+        server.write_all(&[0x77]).unwrap();
+        drain_setup_response(&mut client).unwrap();
+        let mut next = [0u8; 1];
+        client.read_exact(&mut next).unwrap();
+        assert_eq!(next[0], 0x77);
+    }
+
+    #[test]
+    fn drain_propagates_error_on_partial_header() {
+        let (mut client, mut server) = loopback_pair();
+        // Peer sends only part of the header, then closes the connection.
+        server.write_all(&[0u8; 8]).unwrap();
+        drop(server);
+        // F10: this must be an error now, not a silently swallowed Ok.
+        assert!(drain_setup_response(&mut client).is_err());
+    }
+
+    #[test]
+    fn drain_propagates_error_on_partial_body() {
+        let (mut client, mut server) = loopback_pair();
+        let header = make_header(10, 10);
+        server.write_all(&header).unwrap();
+        server.write_all(&[0u8; 4]).unwrap(); // only 4 of 10 body bytes
+        drop(server);
+        assert!(drain_setup_response(&mut client).is_err());
+    }
+
+    // ---- read_response framing ----
+
+    #[test]
+    fn read_response_uncompressed() {
+        let (mut client, mut server) = loopback_pair();
+        let body: Vec<u8> = (0..50u8).collect();
+        let header = make_header(body.len() as u16, body.len() as u16);
+        server.write_all(&header).unwrap();
+        server.write_all(&body).unwrap();
+        let got = TdxClient::read_response(&mut client).unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn read_response_zlib_compressed() {
+        let (mut client, mut server) = loopback_pair();
+        let original: Vec<u8> = (0..200u8).map(|i| i % 7).collect();
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&original).unwrap();
+        let compressed = enc.finish().unwrap();
+        assert_ne!(compressed.len(), original.len());
+        let header = make_header(compressed.len() as u16, original.len() as u16);
+        server.write_all(&header).unwrap();
+        server.write_all(&compressed).unwrap();
+        let got = TdxClient::read_response(&mut client).unwrap();
+        assert_eq!(got, original);
+    }
+
+    // ---- connect_and_handshake (F10 + F22 integration, loopback mock) ----
+
+    /// Mock TDX server: answers the three setup commands with empty responses.
+    fn mock_handshake_server(listener: std::net::TcpListener) {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        for cmd_len in [13usize, 13, 42] {
+            let mut cmd = vec![0u8; cmd_len];
+            sock.read_exact(&mut cmd).unwrap();
+            sock.write_all(&make_header(0, 0)).unwrap();
+        }
+    }
+
+    #[test]
+    fn connect_and_handshake_success() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || mock_handshake_server(listener));
+        let stream =
+            TdxClient::connect_and_handshake(&format!("127.0.0.1:{}", addr.port())).unwrap();
+        assert!(stream.nodelay().unwrap()); // F22: TCP_NODELAY enabled
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_and_handshake_fails_cleanly_on_broken_handshake() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut cmd = [0u8; 13];
+            sock.read_exact(&mut cmd).unwrap();
+            // Reply with a partial header, then close: connect must fail.
+            sock.write_all(&[0u8; 6]).unwrap();
+        });
+        let result = TdxClient::connect_and_handshake(&format!("127.0.0.1:{}", addr.port()));
+        assert!(result.is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_and_handshake_refused() {
+        // Bind then drop the listener so the port is (almost certainly) closed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let result = TdxClient::connect_and_handshake(&format!("127.0.0.1:{}", addr.port()));
+        assert!(result.is_err());
+    }
 }

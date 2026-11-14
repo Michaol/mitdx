@@ -2,6 +2,7 @@ import logging
 import urllib.request
 import re
 import datetime
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -61,30 +62,61 @@ def _get_holidays_from_cache():
 # Module level cached set of Chinese holiday date strings "YYYY-MM-DD"
 _CN_HOLIDAYS = None
 
+# Cooldown between fetch retries while holiday data is unavailable, so a
+# batch of is_holiday() calls does not hammer the network (5s timeout each).
+FETCH_RETRY_COOLDOWN_SECONDS = 60
+_last_failed_fetch = None  # monotonic timestamp of the last failed/empty load
+
 def _load_holidays():
-    global _CN_HOLIDAYS
+    global _CN_HOLIDAYS, _last_failed_fetch
     if _CN_HOLIDAYS is not None:
         return _CN_HOLIDAYS
-        
-    _CN_HOLIDAYS = set()
+
+    if (
+        _last_failed_fetch is not None
+        and time.monotonic() - _last_failed_fetch < FETCH_RETRY_COOLDOWN_SECONDS
+    ):
+        # Recent failure: degrade to weekend-only without refetching.
+        # Nothing is cached permanently; retry once the cooldown elapses.
+        return set()
+
+    holidays = set()
     csv_data = _get_holidays_from_cache()
-    if not csv_data:
-        return _CN_HOLIDAYS
-        
-    for line in csv_data.split('\n'):
-        parts = line.strip().split('|')
-        if len(parts) >= 3:
-            date_str = parts[0] # YYYYMMDD
-            country = parts[2]
-            if country == '中国' and len(date_str) == 8:
-                formatted = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
-                _CN_HOLIDAYS.add(formatted)
-                
+    if csv_data:
+        for line in csv_data.split('\n'):
+            parts = line.strip().split('|')
+            if len(parts) >= 3:
+                date_str = parts[0] # YYYYMMDD
+                country = parts[2]
+                if country == '中国' and len(date_str) == 8:
+                    formatted = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                    holidays.add(formatted)
+
+    if not holidays:
+        # Do NOT cache an empty/missing dataset: leave _CN_HOLIDAYS as None
+        # so a later call retries the fetch. Caching an empty set here would
+        # silently report statutory holidays as trading days for the whole
+        # process lifetime. The cooldown throttles the retries.
+        _last_failed_fetch = time.monotonic()
+        logger.warning(
+            "Holiday data unavailable; falling back to weekend-only detection "
+            "(statutory holidays may be reported as trading days). "
+            "Will retry after a %ds cooldown.",
+            FETCH_RETRY_COOLDOWN_SECONDS,
+        )
+        return holidays
+
+    _CN_HOLIDAYS = holidays
+    _last_failed_fetch = None
     return _CN_HOLIDAYS
 
 def is_holiday(date: Optional[datetime.date] = None) -> bool:
     """
     Check if a given date is a holiday (festival or weekend) in China.
+
+    If holiday data cannot be fetched or loaded from cache, this degrades to
+    weekend-only detection (a warning is logged) and retries after a short
+    cooldown.
     """
     if date is None:
         date = datetime.datetime.now().date()

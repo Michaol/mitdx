@@ -70,3 +70,6 @@ docs/_build/
 
 # Pyenv
 .python-version
+
+# Local build/CI logs
+/macos_arm_log.txt

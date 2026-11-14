@@ -31,7 +31,9 @@ def _init_parser() -> argparse.ArgumentParser:
     r_parser.add_argument("type", choices=["daily", "minute", "fzline"], help="Data type")
     r_parser.add_argument("--symbol", required=True, help="Stock code (e.g. sh600036)")
     r_parser.add_argument("--tdxdir", default="C:/new_tdx", help="TDX installation directory")
-    r_parser.add_argument("--market", default="std", choices=["std", "ext"], help="Market type")
+    # 'ext' intentionally omitted: ExtReader has no extended-market (ds)
+    # routing and behaves identically to StdReader (see reader.ExtReader).
+    r_parser.add_argument("--market", default="std", choices=["std"], help="Market type")
 
     return parser
 

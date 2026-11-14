@@ -30,6 +30,41 @@
 
 ## Changelog
 
+### v1.1.11 (2026-11-14)
+
+代码审查全量修复（24 项发现 + 终审 9 项 + Sonar 反馈），离线测试 262 + Rust 单元测试 35 全部通过。
+
+**关键修复**
+
+- Reader 市场推断对齐 mootdx 规则链：000xxx/002xxx 等深市代码不再误读沪市指数文件；补齐 132/204/7x/bj 前缀、默认市场与大小写归一化。
+- 带前缀 symbol（`sh600036`/`SH600036`）统一剥离并小写化后再发送，杜绝静默查错证券。
+
+**协议与并发 (Rust)**
+
+- 全部阻塞网络 I/O 释放 GIL（`py.detach`），不再冻结其他 Python 线程。
+- 握手响应改用 `read_exact`，消除 TCP 分段导致的响应流错位；握手失败显式报错。
+- `get_price` 移位溢出防护 + 截断守卫：畸形包不再 panic 或产生全零垃圾记录。
+- `quotes` 包长溢出显式报错（不再静默 u16 截断）；Python 侧按 80 只分批。
+- 支持域名连接（`ToSocketAddrs`）与 `TCP_NODELAY`；ping 时延不再计入 DNS 时间。
+- `finance()` 补齐 `baoliu2` 字段（35 字段，与 pytdx 实盘差分零偏差）。
+
+**健壮性 (Python)**
+
+- `k()` 分页回溯历史（82 批 × 800 根，受 u16 start 协议上限约束）；日期校验前置于连接。
+- `affair`：异常路径断连；服务器文件名路径穿越拦截；下载 512MiB/10 万轮上限；.dat 头部与聚合单元数校验。
+- `calendar`：节假日数据缺失不再永久缓存空集合，60s 冷却重试。
+- 用户输入错误不再触发断连重连；`quotes([])` 零网络立即返回。
+
+**文档与工程**
+
+- 修正 frequency 表（5=周线 6=月线 7/8=1分钟 10=季线 11=年线）。
+- 补充 MIT LICENSE；CI release 权限收紧（仅 id-token）；版本号三处统一。
+- Sonar S3776/S8513/S125/S6546 清零；9 个 S1313 hotspot 审查为 SAFE（公开行情服务器地址）。
+- `test_calendar` 标记 `network`；README 开发指引改为 `pytest -m "not network"`。
+
+<details>
+<summary>历史版本</summary>
+
 ### v1.1.10 (2026-05-26)
 
 安全修复：添加 `uv.lock` 锁定 Python 依赖版本（25 个包），解决依赖版本不可预测的安全警告。
@@ -50,9 +85,6 @@
 新增 Python API：`index_bars()` · `minute_data()` · `history_minute_data()` · `history_transactions()` · `block_meta()` · `block_info()` · `k()`
 
 其他：`index()` 现为 `index_bars()` 别名，自动识别指数市场码 (000xxx/88xxxx/99xxxx→SH，399xxx→SZ)；新增 `_parse_block_data()` Python 板块文件解析器；`k()` 支持日期范围 K 线查询。
-
-<details>
-<summary>历史版本</summary>
 
 **v1.1.8 (2026-05-25)**
 
@@ -209,12 +241,12 @@ q.disconnect()
 
 | 值   | 含义   | 值      | 含义            |
 | ---- | ------ | ------- | --------------- |
-| `0`  | 5分钟  | `5`     | 15分钟          |
-| `1`  | 15分钟 | `6`     | 30分钟          |
-| `2`  | 30分钟 | `7`     | 1小时           |
-| `3`  | 1小时  | `8`     | 日线            |
+| `0`  | 5分钟  | `5`     | 周线            |
+| `1`  | 15分钟 | `6`     | 月线            |
+| `2`  | 30分钟 | `7`     | 1分钟           |
+| `3`  | 1小时  | `8`     | 1分钟           |
 | `4`  | 日线   | **`9`** | **日线 (默认)** |
-| `10` | 周线   | `11`    | 月线            |
+| `10` | 季线   | `11`    | 年线            |
 
 ### Affair — 财务数据
 
@@ -299,7 +331,7 @@ mitdx/
 python -m venv .venv && .venv\Scripts\activate
 pip install maturin pytest pandas polars
 maturin develop --release
-pytest tests/ -v
+pytest -m "not network" -v   # 离线测试；联网测试需显式 -m network
 ```
 
 ## 从 mootdx 迁移
@@ -323,4 +355,4 @@ pytest tests/ -v
 
 ## License
 
-MIT
+[MIT](LICENSE)

@@ -5,6 +5,22 @@ MARKET_SH = 1  # 上海
 # Security list batch size (TDX protocol limit per request)
 SECURITY_LIST_BATCH_SIZE = 1000
 
+# Maximum number of bars a single get_security_bars request may return
+# (TDX protocol limit). k() paginates backwards in batches of this size.
+MAX_BARS_PER_REQUEST = 800
+
+# Safety cap on the number of batches k() fetches when paginating backwards
+# through history: at most MAX_K_BATCHES * MAX_BARS_PER_REQUEST bars.
+# The wire protocol's `start` field is u16 (max 65535), so the last batch
+# start, (MAX_K_BATCHES - 1) * MAX_BARS_PER_REQUEST, must stay <= 65535:
+# 82 batches -> last start 64800, at most 65600 bars.
+MAX_K_BATCHES = 82
+
+# Maximum number of symbols per get_security_quotes request (TDX server
+# convention). Larger lists are split into batches to stay well below the
+# u16 packet-length limit of the wire protocol.
+QUOTES_BATCH_SIZE = 80
+
 # Static list of HQ (行情) hosts for real-time quotes
 HQ_HOSTS = [  # NOSONAR - server address configuration, not credentials
     # (name, ip, port)

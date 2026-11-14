@@ -1,6 +1,8 @@
-from typing import Optional, List, Dict, Any, Union
+from __future__ import annotations
 
-def to_df(data: List[Union[Dict[str, Any], tuple]], columns: Optional[List[str]] = None, backend: str = 'pandas') -> Any:
+from typing import Optional, List, Dict, Any
+
+def to_df(data: List[Dict[str, Any] | tuple], columns: Optional[List[str]] = None, backend: str = 'pandas') -> Any:
     """
     Convert a list of dicts or tuples to a DataFrame using the specified backend.
 
@@ -17,7 +19,9 @@ def to_df(data: List[Union[Dict[str, Any], tuple]], columns: Optional[List[str]]
             import pandas as pd
             return pd.DataFrame(columns=columns)
 
-    use_tuple = columns and isinstance(data[0], tuple)
+    # Tuple rows need orient="row" on polars even without explicit columns
+    # (otherwise polars 1.x raises TypeError inferring mixed-type columns).
+    use_tuple = isinstance(data[0], tuple)
     if backend == 'polars':
         import polars as pl
         return pl.DataFrame(data, schema=columns, orient="row") if use_tuple else pl.DataFrame(data)

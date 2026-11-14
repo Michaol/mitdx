@@ -1,8 +1,17 @@
+import datetime
 import logging
 from typing import List, Optional, Tuple, Union
 from mitdx._core import TdxClient, ping_servers
 from mitdx.utils import to_df
-from mitdx.consts import HQ_HOSTS, MARKET_SH, MARKET_SZ, SECURITY_LIST_BATCH_SIZE
+from mitdx.consts import (
+    HQ_HOSTS,
+    MARKET_SH,
+    MARKET_SZ,
+    MAX_BARS_PER_REQUEST,
+    MAX_K_BATCHES,
+    QUOTES_BATCH_SIZE,
+    SECURITY_LIST_BATCH_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -12,12 +21,29 @@ logger = logging.getLogger(__name__)
 _VALID_SECURITY_MARKETS = (MARKET_SZ, MARKET_SH)
 
 
+def _normalize_code(symbol: str) -> str:
+    """Normalize a security code before sending it to the TDX server.
+
+    Lowercases the symbol and strips ONE leading market prefix ('sh'/'sz'),
+    e.g. 'SH600036' -> '600036'. The Rust core truncates codes to 6 bytes,
+    so a raw prefixed code ('sh600036' -> b'sh6000') would silently query
+    the wrong security. Market inference lives in _market_code() and
+    _index_market_code().
+    """
+    s = str(symbol).strip().lower()
+    for prefix in ("sh", "sz"):
+        if s.startswith(prefix):
+            return s.removeprefix(prefix)
+    return s
+
+
 def _market_code(symbol: str) -> int:
     """Infer TDX market code from symbol string.
     Shanghai (market=1): starts with 5, 6, 9, or 7
     Shenzhen (market=0): everything else (0, 1, 2, 3)
+    Accepts prefixed symbols ('sh600036', 'SZ000001').
     """
-    s = str(symbol).lower().removeprefix("sh").removeprefix("sz")
+    s = _normalize_code(symbol)
     if s and s[0] in ("5", "6", "9", "7"):
         return MARKET_SH
     return MARKET_SZ
@@ -27,9 +53,10 @@ def _index_market_code(symbol: str) -> int:
     """Infer TDX market code for index/指数 symbols.
     Shanghai indices (market=1): 000xxx (上证指数), 88xxxx, 99xxxx
     Shenzhen indices (market=0): 399xxx (深证指数)
+    Accepts prefixed symbols ('sh000001', 'SZ399001').
     """
-    s = str(symbol).strip()
-    if s[:3] in ("000", "888", "999") or s[:2] in ("88", "99"):
+    s = _normalize_code(symbol)
+    if s[:3] == "000" or s[:2] in ("88", "99"):
         return MARKET_SH
     return MARKET_SZ
 
@@ -41,6 +68,69 @@ def _validate_market(market: int) -> None:
             f"market must be {MARKET_SZ} (Shenzhen) or {MARKET_SH} (Shanghai), "
             f"got {market!r}"
         )
+
+
+def _parse_date(s):
+    """Parse 'YYYY-MM-DD' or 'YYYYMMDD' into a date; None passes through.
+
+    Raises ValueError on malformed input (callers validate before connecting).
+    """
+    if s is None:
+        return None
+    s = str(s).replace('-', '')
+    return datetime.date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+
+
+def _bar_date(bar):
+    """Date portion of a bar's datetime, or None if unparseable."""
+    dt_str = bar.get("datetime", "")
+    if len(dt_str) < 10:
+        return None
+    try:
+        return _parse_date(dt_str[:10])
+    except ValueError:
+        return None
+
+
+def _fetch_k_batches(client, frequency: int, market: int, code: str, begin_dt) -> List[dict]:
+    """Paginate backwards from the most recent bar in MAX_BARS_PER_REQUEST batches.
+
+    Stops on an empty batch, when a batch's earliest bar predates begin_dt,
+    or after MAX_K_BATCHES batches. The cap also keeps every `start` offset
+    within the protocol's u16 range (see consts.MAX_K_BATCHES).
+    """
+    bars: List[dict] = []
+    for batch_idx in range(MAX_K_BATCHES):
+        batch = client.get_security_bars(
+            category=frequency, market=market, code=code,
+            start=batch_idx * MAX_BARS_PER_REQUEST, count=MAX_BARS_PER_REQUEST,
+        )
+        if not batch:
+            break
+        bars.extend(batch)
+        # Batches arrive oldest-first; once a batch reaches back before
+        # begin, older batches cannot contain wanted bars.
+        if begin_dt is not None:
+            earliest = _bar_date(batch[0])
+            if earliest is not None and earliest < begin_dt:
+                break
+    return bars
+
+
+def _filter_bars_by_date(bars: List[dict], begin_dt, end_dt) -> List[dict]:
+    """Keep bars within [begin_dt, end_dt] inclusive; unparseable dates pass."""
+    if begin_dt is None and end_dt is None:
+        return bars
+    filtered = []
+    for bar in bars:
+        bar_dt = _bar_date(bar)
+        if bar_dt is not None:
+            if begin_dt is not None and bar_dt < begin_dt:
+                continue
+            if end_dt is not None and bar_dt > end_dt:
+                continue
+        filtered.append(bar)
+    return filtered
 
 
 def _parse_block_data(data: bytes) -> List[dict]:
@@ -138,11 +228,18 @@ class Quotes:
             ips = [(ip, port) for name, ip, port in HQ_HOSTS]
             fastest_servers = ping_servers(ips)
 
-            # Try top 3 lowest-latency servers
+            # Try top 3 lowest-latency servers. A failed attempt (exception
+            # or False) must not prevent trying the remaining candidates.
             for ip, port, latency in fastest_servers[:3]:
                 if latency < 9999:  # Not completely failed
-                    if self.connect(ip, port):
-                        return
+                    try:
+                        if self.connect(ip, port):
+                            return
+                    except Exception:
+                        logger.debug(
+                            "Connect attempt to %s:%s failed", ip, port, exc_info=True
+                        )
+                        continue
 
             raise ConnectionError("Failed to connect to any TDX HQ server. All pings failed.")
 
@@ -197,6 +294,9 @@ class Quotes:
         market: 0 = Shenzhen (深圳), 1 = Shanghai (上海)
         """
         self._ensure_connected()
+        # Validate user input before the network try-block so an invalid
+        # market raises ValueError without tearing down the connection.
+        _validate_market(market)
         try:
             all_stocks = self._fetch_security_batch(market)
             return to_df(all_stocks, backend=backend)
@@ -237,8 +337,9 @@ class Quotes:
         """
         self._ensure_connected()
         market = _market_code(symbol)
+        code = _normalize_code(symbol)
         try:
-            res = self.client.get_security_bars(category=frequency, market=market, code=symbol, start=start, count=count)
+            res = self.client.get_security_bars(category=frequency, market=market, code=code, start=start, count=count)
             return to_df(res, backend=backend)
         except Exception:
             logger.exception("Failed to fetch bars for symbol=%s", symbol)
@@ -266,8 +367,9 @@ class Quotes:
         """
         self._ensure_connected()
         market = _index_market_code(symbol)
+        code = _normalize_code(symbol)
         try:
-            res = self.client.get_index_bars(category=frequency, market=market, code=symbol, start=start, count=count)
+            res = self.client.get_index_bars(category=frequency, market=market, code=code, start=start, count=count)
             return to_df(res, backend=backend)
         except Exception:
             logger.exception("Failed to fetch index bars for symbol=%s", symbol)
@@ -286,8 +388,9 @@ class Quotes:
         """
         self._ensure_connected()
         market = _market_code(symbol)
+        code = _normalize_code(symbol)
         try:
-            res = self.client.get_xdxr_info(market=market, code=symbol)
+            res = self.client.get_xdxr_info(market=market, code=code)
             return to_df(res, backend=backend)
         except Exception:
             logger.exception("Failed to fetch xdxr for symbol=%s", symbol)
@@ -303,8 +406,9 @@ class Quotes:
         """
         self._ensure_connected()
         market = _market_code(symbol)
+        code = _normalize_code(symbol)
         try:
-            res = self.client.get_transaction_data(market=market, code=symbol, start=start, count=count)
+            res = self.client.get_transaction_data(market=market, code=code, start=start, count=count)
             return to_df(res, backend=backend)
         except Exception:
             logger.exception("Failed to fetch transactions for symbol=%s", symbol)
@@ -318,26 +422,38 @@ class Quotes:
         """
         Fetch real-time quote snapshots (5-level order book).
         symbols can be:
-          - a single stock code string: '600036'
+          - a single stock code string: '600036' (prefixed 'sh600036' also works)
           - a list of stock code strings: ['600036', '000001']
           - a list of (market, code) tuples: [(1, '600036'), (0, '000001')]
+        Codes are normalized (lowercased, one leading sh/sz prefix stripped).
+        The request is split into batches of at most QUOTES_BATCH_SIZE (80)
+        symbols — the TDX server convention — and results are concatenated
+        in input order. An empty list returns an empty DataFrame without
+        contacting the server.
         """
-        self._ensure_connected()
-
         # Normalize to list of (market, code) tuples
         stock_list: List[Tuple[int, str]]
         if isinstance(symbols, str):
-            stock_list = [(_market_code(symbols), symbols)]
+            stock_list = [(_market_code(symbols), _normalize_code(symbols))]
         elif isinstance(symbols, list) and len(symbols) > 0:
             if isinstance(symbols[0], str):
-                stock_list = [(_market_code(s), s) for s in symbols]
+                stock_list = [(_market_code(s), _normalize_code(s)) for s in symbols]
             else:
-                stock_list = [(int(m), str(c)) for m, c in symbols]
+                stock_list = [(int(m), _normalize_code(c)) for m, c in symbols]
         else:
             stock_list = []
 
+        # Empty input: return immediately without pinging/connecting.
+        if not stock_list:
+            return to_df([], backend=backend)
+
+        self._ensure_connected()
+
         try:
-            res = self.client.get_security_quotes(stock_list=stock_list)
+            res: List[dict] = []
+            for i in range(0, len(stock_list), QUOTES_BATCH_SIZE):
+                batch = stock_list[i:i + QUOTES_BATCH_SIZE]
+                res.extend(self.client.get_security_quotes(stock_list=batch))
             return to_df(res, backend=backend)
         except Exception:
             logger.exception("Failed to fetch quotes for symbols=%s", symbols)
@@ -350,12 +466,13 @@ class Quotes:
     def finance(self, symbol: str = '600036', backend: str = 'pandas', **kwargs):
         """
         Fetch financial summary for a stock (流通股本, 总资产, 净利润 etc).
-        Returns a single-row DataFrame with 34 financial fields.
+        Returns a single-row DataFrame with 35 financial fields.
         """
         self._ensure_connected()
         market = _market_code(symbol)
+        code = _normalize_code(symbol)
         try:
-            res = self.client.get_finance_info(market=market, code=symbol)
+            res = self.client.get_finance_info(market=market, code=code)
             return to_df([res], backend=backend)
         except Exception:
             logger.exception("Failed to fetch finance for symbol=%s", symbol)
@@ -372,8 +489,9 @@ class Quotes:
         """
         self._ensure_connected()
         market = _market_code(symbol)
+        code = _normalize_code(symbol)
         try:
-            categories = self.client.get_company_info_category(market=market, code=symbol)
+            categories = self.client.get_company_info_category(market=market, code=code)
             result = {"category": categories, "content": ""}
             # Fetch all content sections
             parts = []
@@ -383,7 +501,7 @@ class Quotes:
                 length = cat.get("length", 0)
                 if fname and length > 0:
                     text = self.client.get_company_info_content(
-                        market=market, code=symbol, filename=fname, start=start, length=length
+                        market=market, code=code, filename=fname, start=start, length=length
                     )
                     parts.append(text)
             result["content"] = "\n".join(parts)
@@ -403,8 +521,9 @@ class Quotes:
         """
         self._ensure_connected()
         market = _market_code(symbol)
+        code = _normalize_code(symbol)
         try:
-            res = self.client.get_minute_time_data(market=market, code=symbol)
+            res = self.client.get_minute_time_data(market=market, code=code)
             return to_df(res, backend=backend)
         except Exception:
             logger.exception("Failed to fetch minute data for symbol=%s", symbol)
@@ -422,8 +541,9 @@ class Quotes:
         """
         self._ensure_connected()
         market = _market_code(symbol)
+        code = _normalize_code(symbol)
         try:
-            res = self.client.get_history_minute_time_data(market=market, code=symbol, date=date)
+            res = self.client.get_history_minute_time_data(market=market, code=code, date=date)
             return to_df(res, backend=backend)
         except Exception:
             logger.exception("Failed to fetch history minute data for symbol=%s date=%d", symbol, date)
@@ -441,9 +561,10 @@ class Quotes:
         """
         self._ensure_connected()
         market = _market_code(symbol)
+        code = _normalize_code(symbol)
         try:
             res = self.client.get_history_transaction_data(
-                market=market, code=symbol, start=start, count=count, date=date
+                market=market, code=code, start=start, count=count, date=date
             )
             return to_df(res, backend=backend)
         except Exception:
@@ -510,45 +631,37 @@ class Quotes:
           frequency: int = 9, backend: str = 'pandas', **kwargs):
         """
         Fetch K-line bars within a date range.
-        begin/end: date strings like '2026-01-01' or '20260101'.
-                   If None, fetches from the earliest/latest available.
-        Returns DataFrame with the same columns as bars().
+
+        begin/end: date strings like '2026-01-01' or '20260101' (inclusive).
+        Invalid dates raise ValueError before any network activity.
+
+        Bars are paginated backwards from the most recent, in batches of up
+        to MAX_BARS_PER_REQUEST (800) bars, stopping when a batch is empty,
+        when a batch's earliest bar predates begin, or after MAX_K_BATCHES
+        (82) batches — a safety cap of 65,600 bars, bounded by the protocol's
+        u16 `start` field (max 65535). If begin is None the cap bounds the
+        reachable history; for minute-level frequencies 65,600 bars only
+        cover a few months of trading, so older minute data may be
+        unreachable.
+
+        Returns DataFrame with the same columns as bars(), sorted by
+        datetime ascending and filtered to [begin, end].
         """
-        import datetime as _dt
-
-        self._ensure_connected()
-        market = _market_code(symbol)
-
-        # Normalize dates
-        def _parse_date(s):
-            if s is None:
-                return None
-            s = str(s).replace('-', '')
-            return _dt.date(int(s[:4]), int(s[4:6]), int(s[6:8]))
-
+        # Validate user-supplied dates BEFORE connecting / entering the
+        # network try-block, so a bad date raises without disconnecting.
         begin_dt = _parse_date(begin)
         end_dt = _parse_date(end)
 
+        self._ensure_connected()
+        market = _market_code(symbol)
+        code = _normalize_code(symbol)
+
         try:
-            # Fetch a large batch and filter by date
-            res = self.client.get_security_bars(
-                category=frequency, market=market, code=symbol, start=0, count=800
-            )
-
-            if begin_dt or end_dt:
-                filtered = []
-                for bar in res:
-                    dt_str = bar.get("datetime", "")
-                    if len(dt_str) >= 10:
-                        bar_dt = _parse_date(dt_str[:10])
-                        if begin_dt and bar_dt and bar_dt < begin_dt:
-                            continue
-                        if end_dt and bar_dt and bar_dt > end_dt:
-                            continue
-                    filtered.append(bar)
-                res = filtered
-
-            return to_df(res, backend=backend)
+            bars = _fetch_k_batches(self.client, frequency, market, code, begin_dt)
+            bars = _filter_bars_by_date(bars, begin_dt, end_dt)
+            # Batches were accumulated newest-first; restore chronological order.
+            bars.sort(key=lambda b: b.get("datetime", ""))
+            return to_df(bars, backend=backend)
         except Exception:
             logger.exception("Failed to fetch k data for symbol=%s", symbol)
             self.disconnect()

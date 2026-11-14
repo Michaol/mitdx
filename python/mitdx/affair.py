@@ -1,13 +1,29 @@
+from __future__ import annotations
+
 import tempfile
 import shutil
 import struct
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, List, Dict, Union, Tuple, Any
+from typing import Optional, List, Dict, Tuple, Any, Iterator
 
 from mitdx._core import TdxClient
 from mitdx.columns import columns as COLUMNS
 from mitdx.consts import GP_HOSTS
 from mitdx.utils import to_df
+
+# Safety caps for server-driven downloads: a broken or malicious server must
+# not be able to stream forever (infinite loop) or exhaust memory. The byte
+# cap dominates for full-size chunks (~30000 bytes each); the round cap also
+# stops servers that dribble out tiny chunks indefinitely.
+_MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # 512 MiB total per file
+_MAX_DOWNLOAD_ROUNDS = 100_000  # max request/response rounds per file
+
+# Aggregate cap on parsed financial cells (stocks x fields). Per-entry offset
+# checks alone are not enough: every index entry may point at the SAME valid
+# payload, so max_count * report_fields_count floats could still be allocated.
+# Real gpcw files are ~6000 stocks x ~580 fields (~3.5M cells); 10M is generous.
+_MAX_FINANCIAL_CELLS = 10_000_000
 
 def _get_connected_client() -> TdxClient:
     client = TdxClient()
@@ -19,13 +35,62 @@ def _get_connected_client() -> TdxClient:
             pass
     raise ConnectionError("Failed to connect to any TDX Financial (GP) Server to fetch affairs")
 
+@contextmanager
+def _connected_client() -> Iterator[TdxClient]:
+    """Yield a connected GP client; disconnect even if the caller raises."""
+    client = _get_connected_client()
+    try:
+        yield client
+    finally:
+        client.disconnect()
+
+def _validate_filename(filename: str) -> None:
+    """Reject filenames that could escape the download directory.
+
+    Filenames may come from the server (via files()), so a name must be a
+    single plain path component: no '/', '\\', '..' or null bytes, and equal
+    to its own basename. 'gpcw..zip' is rejected as well — legitimate TDX
+    filenames (gpcw20240331.zip, gpcw.txt) never contain '..'.
+    """
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or '/' in filename
+        or '\\' in filename
+        or '..' in filename
+        or '\x00' in filename
+        or Path(filename).name != filename
+    ):
+        raise ValueError(
+            f"Unsafe financial filename (must be a plain name without path "
+            f"separators, '..' or null bytes): {filename!r}"
+        )
+
 def _fetch_file_content(client: TdxClient, filename: str, filesize: int = 0) -> bytes:
     offset = 0
+    rounds = 0
     buf = bytearray()
     while True:
+        if rounds >= _MAX_DOWNLOAD_ROUNDS:
+            raise IOError(
+                f"Download of {filename!r} exceeded {_MAX_DOWNLOAD_ROUNDS} "
+                f"request rounds ({len(buf)} bytes received); aborting to "
+                f"avoid an endless transfer"
+            )
         chunksize, data = client.get_report_file(filename, offset)
-        if chunksize == 0 or not data:
+        rounds += 1
+        if chunksize <= 0 or not data:
             break
+        if len(data) > chunksize:
+            raise IOError(
+                f"Malformed response for {filename!r} at offset {offset}: "
+                f"server declared chunksize {chunksize} but sent {len(data)} bytes"
+            )
+        if len(buf) + len(data) > _MAX_DOWNLOAD_BYTES:
+            raise IOError(
+                f"Download of {filename!r} exceeded {_MAX_DOWNLOAD_BYTES} bytes "
+                f"(received {len(buf)} + {len(data)}); aborting"
+            )
         buf.extend(data)
         offset += chunksize  # use the chunksize requested increment
         if len(data) < chunksize:  # server returned less than requested, EOF
@@ -34,13 +99,63 @@ def _fetch_file_content(client: TdxClient, filename: str, filesize: int = 0) -> 
             break
     return bytes(buf)
 
+def _validate_dat_header(
+    data_header: bytes,
+    header_pack_format: str,
+    header_size: int,
+    file_size: int,
+    stock_item_size: int,
+    dat_path: Path,
+) -> Tuple[int, int, int]:
+    """Unpack and bounds-check the gpcw header; return (max_count, report_date, report_size).
+
+    Header values come from the (untrusted) file: bound them against the
+    actual file size before allocating/seeking. Extracted from _parse_file
+    to keep both functions under the cognitive-complexity limit (S3776).
+    """
+    if len(data_header) != header_size:
+        raise ValueError(
+            f"Malformed financial file {dat_path}: truncated header "
+            f"(expected {header_size} bytes, got {len(data_header)})"
+        )
+    stock_header = struct.unpack(header_pack_format, data_header)
+    max_count = stock_header[2]
+    report_date = stock_header[1]
+    report_size = stock_header[4]
+
+    # report_size is a float-array byte count: a positive multiple of 4
+    # that fits in the file.
+    if report_size == 0 or report_size % 4 != 0 or report_size > file_size:
+        raise ValueError(
+            f"Malformed financial file {dat_path}: invalid report_size "
+            f"{report_size} (file is {file_size} bytes; must be a "
+            f"positive multiple of 4 within the file)"
+        )
+    index_end = header_size + max_count * stock_item_size
+    if index_end > file_size:
+        raise ValueError(
+            f"Malformed financial file {dat_path}: header declares "
+            f"{max_count} stocks but the index table needs {index_end} "
+            f"bytes (file is {file_size} bytes)"
+        )
+    # Aggregate bound: every index entry may point at the SAME valid payload,
+    # so per-entry offset checks alone still allow max_count * fields floats.
+    total_cells = max_count * (report_size // 4)
+    if total_cells > _MAX_FINANCIAL_CELLS:
+        raise ValueError(
+            f"Malformed financial file {dat_path}: header declares "
+            f"{max_count} stocks x {report_size // 4} fields "
+            f"({total_cells} cells), exceeding the "
+            f"{_MAX_FINANCIAL_CELLS}-cell safety cap"
+        )
+    return max_count, report_date, report_size
+
 class Affair:
     @staticmethod
-    def files() -> List[Dict[str, Union[str, int]]]:
+    def files() -> List[Dict[str, str | int]]:
         """Fetch list of all available financial files on TDX"""
-        client = _get_connected_client()
-        data = _fetch_file_content(client, "tdxfin/gpcw.txt", 0)
-        client.disconnect()
+        with _connected_client() as client:
+            data = _fetch_file_content(client, "tdxfin/gpcw.txt", 0)
 
         content = data.decode('utf-8').strip().split('\n')
         results = []
@@ -54,15 +169,17 @@ class Affair:
     @staticmethod
     def fetch(downdir: str = '.', filename: Optional[str] = None):
         """Download financial zip file from TDX servers"""
+        if not filename:
+            raise NotImplementedError("Batch downloading all files is currently not supported. Provide 'filename'.")
+        # Validate before any I/O: the name may come from the server and is
+        # joined into the local write path below.
+        _validate_filename(filename)
+
         downdir_path = Path(downdir)
         downdir_path.mkdir(parents=True, exist_ok=True)
 
-        if not filename:
-            raise NotImplementedError("Batch downloading all files is currently not supported. Provide 'filename'.")
-
-        client = _get_connected_client()
-        data = _fetch_file_content(client, f"tdxfin/{filename}", 0)
-        client.disconnect()
+        with _connected_client() as client:
+            data = _fetch_file_content(client, f"tdxfin/{filename}", 0)
 
         dest = downdir_path / filename
         dest.write_bytes(data)
@@ -73,6 +190,7 @@ class Affair:
         """Fetch and parse financial zip/dat into DataFrame"""
         if not filename:
             raise ValueError("Filename must be provided")
+        _validate_filename(filename)
 
         filepath = Path(downdir) / filename
         if not filepath.exists():
@@ -100,25 +218,44 @@ class Affair:
             else:
                 raise ValueError(f"File must be .zip or .dat, got: {filepath.suffix}")
 
+            file_size = dat_path.stat().st_size
             with open(dat_path, 'rb') as dat_fp:
                 data_header = dat_fp.read(header_size)
-                stock_header = struct.unpack(header_pack_format, data_header)
-
-                max_count = stock_header[2]
-                report_date = stock_header[1]
-                report_size = stock_header[4]
-
+                max_count, report_date, report_size = _validate_dat_header(
+                    data_header, header_pack_format, header_size,
+                    file_size, stock_item_size, dat_path,
+                )
                 report_fields_count = report_size // 4
                 report_pack_format = f'<{report_fields_count}f'
 
                 results = []
                 for stock_idx in range(max_count):
                     dat_fp.seek(header_size + stock_idx * stock_item_size)
-                    stock_item = struct.unpack('<6s1c1L', dat_fp.read(stock_item_size))
+                    item_data = dat_fp.read(stock_item_size)
+                    if len(item_data) != stock_item_size:
+                        raise ValueError(
+                            f"Malformed financial file {dat_path}: truncated index "
+                            f"entry for stock #{stock_idx} (expected {stock_item_size} "
+                            f"bytes, got {len(item_data)})"
+                        )
+                    stock_item = struct.unpack('<6s1c1L', item_data)
                     code = stock_item[0].decode('utf-8')
 
-                    dat_fp.seek(stock_item[2])
+                    payload_offset = stock_item[2]
+                    if payload_offset + report_size > file_size:
+                        raise ValueError(
+                            f"Malformed financial file {dat_path}: stock {code!r} "
+                            f"report offset {payload_offset} + report_size "
+                            f"{report_size} exceeds file size {file_size}"
+                        )
+                    dat_fp.seek(payload_offset)
                     info_data = dat_fp.read(struct.calcsize(report_pack_format))
+                    if len(info_data) != report_size:
+                        raise ValueError(
+                            f"Malformed financial file {dat_path}: truncated report "
+                            f"payload for stock {code!r} (expected {report_size} "
+                            f"bytes, got {len(info_data)})"
+                        )
                     cw_info = struct.unpack(report_pack_format, info_data)
 
                     results.append((code, report_date) + cw_info)

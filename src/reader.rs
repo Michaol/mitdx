@@ -24,8 +24,8 @@ const DAILY_RECORD_SIZE: usize = 32;
 /// Read daily bars from a .day file. Returns a list of dicts.
 ///
 /// Each dict has keys: date, open, high, low, close, amount, volume.
-/// Price values are divided by the given `price_coeff` (default 0.01 → 分→元).
-/// Amount values are divided by `vol_coeff` (default 0.01).
+/// Price values are multiplied by the given `price_coeff` (default 0.01 → 分→元).
+/// Volume values are multiplied by `vol_coeff` (default 0.01); amount is passed through unscaled.
 #[pyfunction]
 #[pyo3(signature = (filepath, price_coeff=0.01, vol_coeff=0.01))]
 pub fn read_daily_bars(
