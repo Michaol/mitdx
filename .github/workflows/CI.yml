@@ -29,7 +29,7 @@ jobs:
       - name: Run tests
         run: |
           PIPCMD="pip"
-          $PIPCMD install --only-binary :all: dist/*.whl "pytest==8.4.1"
+          $PIPCMD install --only-binary :all: dist/*.whl "pytest==8.4.1" "polars==1.40.1"
           pytest -m "not network" -v
 
   linux:

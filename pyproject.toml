@@ -20,7 +20,7 @@ classifiers = [
 dependencies = ["pandas>=1.5"]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-cov", "ruff"]
+dev = ["pytest", "pytest-cov", "ruff", "polars"]
 
 [project.scripts]
 mitdx = "mitdx.cli:main"
